@@ -12,7 +12,7 @@ Prediction run :
     Bloc = Instruction (5 s ± 1 s) → ON (10 s) → OFF (10 s)
 
 Hardware — front montant sur port parallèle :
-    D1 → 0x02   D2 → 0x04   D3 → 0x08   D4 → 0x10
+    D1 → 2   D2 → 4   D3 → 8   D4 → 16
     Le stimulateur gère le pulse en interne.
 """
 
@@ -31,10 +31,10 @@ import os
 # ═════════════════════════════════════════════════════════════════════════════
 
 FINGER_PIN_MAP: Dict[str, int] = {
-"D1": 0x02,
-"D2": 0x04,
-"D3": 0x08,
-"D4": 0x10,
+    "D1": 2,
+    "D2": 4,
+    "D3": 8,
+    "D4": 16,
 }
 
 FINGERS_4: List[str]          = ["D1", "D2", "D3", "D4"]
@@ -135,7 +135,6 @@ class ConnectElec(BaseTask):
         # ── init chain ────────────────────────────────────────────────────
         self._detect_display_scaling()
         self._measure_frame_rate()
-        self._define_ttl_codes()
         self._setup_key_mapping()
         self._setup_visual_stimuli()
         self._init_incremental_file(
@@ -195,36 +194,6 @@ class ConnectElec(BaseTask):
         )
 
     # ─────────────────────────────────────────────────────────────────────
-    # TTL CODES
-    # ─────────────────────────────────────────────────────────────────────
-
-    def _define_ttl_codes(self) -> None:
-        self.codes: Dict[str, int] = {
-            "start_exp":         255,
-            "end_exp":           254,
-            "rest_start":        200,
-            "rest_end":          201,
-            "run_start":         230,
-            "run_end":           231,
-            "instruction_start": 120,
-            "instruction_end":   121,
-            "block_on_start":    100,
-            "block_on_end":      101,
-            "block_off_start":   110,
-            "block_off_end":     111,
-            "stim_D1":            11,
-            "stim_D2":            12,
-            "stim_D3":            13,
-            "stim_D4":            14,
-            "stim_omission":      15,
-            "condition_FP":       50,
-            "condition_TP":       51,
-            "condition_FR":       52,
-            "condition_TR":       53,
-            "condition_mapping":  54,
-        }
-
-    # ─────────────────────────────────────────────────────────────────────
     # KEYS
     # ─────────────────────────────────────────────────────────────────────
 
@@ -244,14 +213,14 @@ class ConnectElec(BaseTask):
         self.cue_stim = visual.TextStim(
             self.win,
             text="",
-            height=0.06,  # Taille légèrement réduite pour les phrases longues
+            height=0.06,
             color="white",
             pos=(0.0, 0.25),
-            wrapWidth=1.6,  # Plus large pour éviter de couper les mots
+            wrapWidth=1.6,
             font="Arial",
             bold=True,
         )
-        
+
         self.condition_cues: Dict[str, str] = {
             "FP": (
                 "Faites attention à la stimulation de chaque doigt et prédisez\n"
@@ -290,8 +259,8 @@ class ConnectElec(BaseTask):
                 self.condition_images_stim[cond] = visual.ImageStim(
                     self.win,
                     image=path,
-                    size=(0.5*0.7, 0.7*0.7),
-                    pos=(0, -0.5)
+                    size=(0.5 * 0.7, 0.7 * 0.7),
+                    pos=(0, -0.5),
                 )
 
     # ═════════════════════════════════════════════════════════════════════
@@ -321,15 +290,15 @@ class ConnectElec(BaseTask):
         self.global_records.append(entry)
 
     # ═════════════════════════════════════════════════════════════════════
-    # ELECTRICAL STIMULATION — FRONT MONTANT
+    # ELECTRICAL STIMULATION — SIMPLE PARALLEL PORT
     # ═════════════════════════════════════════════════════════════════════
 
     def _send_stim_pulse(
         self, finger: str, is_omission: bool = False
     ) -> Dict[str, Any]:
         """
-        Front montant sur le port parallèle.
-        Le stimulateur détecte le front et gère le pulse.
+        Envoie la valeur du doigt sur le port parallèle.
+        D1=2, D2=4, D3=8, D4=16.
         """
         t_now = self.task_clock.getTime()
 
@@ -341,22 +310,9 @@ class ConnectElec(BaseTask):
                 "time_s":      round(t_now, 6),
             }
 
-        pin_code = self.finger_pin_map.get(finger, 0)
-        ttl_code = self.codes.get(f"stim_{finger}", 0)
-
-        # ── Front montant → reset immédiat ──
-        try:
-            port = getattr(self.ParPort, "port", None)
-            if port is not None:
-                port.setData(pin_code)       # front montant
-                t_sent = self.task_clock.getTime()
-                port.setData(0x00)           # reset
-            else:
-                self.ParPort.send_trigger(pin_code)
-                t_sent = self.task_clock.getTime()
-        except Exception:
-            self.ParPort.send_trigger(pin_code)
-            t_sent = self.task_clock.getTime()
+        pin_code = self.finger_pin_map[finger]
+        self.ParPort.send_trigger(pin_code)
+        t_sent = self.task_clock.getTime()
 
         return {
             "finger":      finger,
@@ -451,8 +407,6 @@ class ConnectElec(BaseTask):
         )
         duration = max(2.0, self.instruction_duration + jitter)
 
-        cond_ttl = self.codes.get(f"condition_{condition}", 0)
-
         self.log_trial_event(
             "instruction_start",
             condition=condition,
@@ -502,7 +456,6 @@ class ConnectElec(BaseTask):
         for si, info in enumerate(stim_seq):
             self.current_trial_idx = si
 
-            # ── chaque stim espacée de 500 ms ──
             t_target = t_start + si * self.stim_interval_s
 
             remaining = t_target - self.task_clock.getTime()
