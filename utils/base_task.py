@@ -294,21 +294,17 @@ class BaseTask:
 
         self.task_clock.reset()
 
-        start_code = self.codes.get('start_exp', 255)
-        self.ParPort.send_trigger(start_code)
-
         if self.eyetracker_actif:
             self.EyeTracker.start_recording()
             self.EyeTracker.send_message(f"START_{self.task_name.upper()}")
 
-        self.logger.ok(f"Trigger reçu. Code: {start_code}")
+        self.logger.ok(f"Trigger reçu")
 
     def show_resting_state(self, duration_s=10.0,
                            code_start_key='rest_start',
                            code_end_key='rest_end'):
         self.logger.log(f"Rest : {duration_s}s")
 
-        self.ParPort.send_trigger(self.codes.get(code_start_key, 0))
         if self.eyetracker_actif:
             self.EyeTracker.send_message("REST_START")
 
@@ -317,7 +313,6 @@ class BaseTask:
         core.wait(duration_s)
 
         if code_end_key:
-            self.ParPort.send_trigger(self.codes.get(code_end_key, 0))
             if self.eyetracker_actif:
                 self.EyeTracker.send_message("REST_END")
 

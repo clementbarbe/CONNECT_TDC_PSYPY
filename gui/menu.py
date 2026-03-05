@@ -21,7 +21,7 @@ class ExperimentMenu(QMainWindow):
         self.setFont(self.global_font)
         
         # Fenêtre redimensionnée pour le confort visuel
-        self.setFixedSize(1300, 1000)
+        self.setFixedSize(1400, 1200)
         
         self.hardware_present = False 
         self.eyelink_present = False  
@@ -85,7 +85,7 @@ class ExperimentMenu(QMainWindow):
         layout.addWidget(QLabel("Session:"))
         self.spin_session = QSpinBox()
         self.spin_session.setRange(1, 20)
-        self.spin_session.setFixedWidth(75)
+        self.spin_session.setFixedWidth(100)
         try: self.spin_session.setValue(int(self.default_config.get('session', 1)))
         except: self.spin_session.setValue(1)
         layout.addWidget(self.spin_session)
@@ -93,7 +93,7 @@ class ExperimentMenu(QMainWindow):
         layout.addWidget(QLabel("Écran:"))
         self.screenid = QSpinBox()
         self.screenid.setRange(1, len(QApplication.screens()))
-        self.screenid.setFixedWidth(75)
+        self.screenid.setFixedWidth(100)
         saved_screen = self.default_config.get('screenid', 1)
         self.screenid.setValue(saved_screen + 1)
         layout.addWidget(self.screenid)
