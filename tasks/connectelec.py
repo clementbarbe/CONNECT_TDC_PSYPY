@@ -31,10 +31,10 @@ import os
 # ═════════════════════════════════════════════════════════════════════════════
 
 FINGER_PIN_MAP: Dict[str, int] = {
-    "D1": 0x02,
-    "D2": 0x04,
-    "D3": 0x08,
-    "D4": 0x10,
+"D1": 0x02,
+"D2": 0x04,
+"D3": 0x08,
+"D4": 0x10,
 }
 
 FINGERS_4: List[str]          = ["D1", "D2", "D3", "D4"]
@@ -586,7 +586,7 @@ class ConnectElec(BaseTask):
             f"{dur:.3f} s | {n_deliv} stim  {n_omit} omit"
         )
         return records
-    
+
     def _run_off_block(
         self,
         block_index: int,
