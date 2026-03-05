@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 
 from psychopy import core, visual
 from utils.base_task import BaseTask
+import os
 
 # ═════════════════════════════════════════════════════════════════════════════
 # CONSTANTS
@@ -501,9 +502,10 @@ class ConnectElec(BaseTask):
         for si, info in enumerate(stim_seq):
             self.current_trial_idx = si
 
-            t_target = t_start + self.block_on_duration
-            remaining = t_target - self.task_clock.getTime()
+            # ── chaque stim espacée de 500 ms ──
+            t_target = t_start + si * self.stim_interval_s
 
+            remaining = t_target - self.task_clock.getTime()
             if remaining > 0:
                 core.wait(remaining, hogCPUperiod=0.001)
 
@@ -555,6 +557,12 @@ class ConnectElec(BaseTask):
                     f"({info['finger']}): {sched_err_ms:+.2f} ms"
                 )
 
+        # ── attendre la fin réelle du bloc ON (10 s) ──
+        t_block_end_target = t_start + self.block_on_duration
+        remaining_block = t_block_end_target - self.task_clock.getTime()
+        if remaining_block > 0:
+            core.wait(remaining_block, hogCPUperiod=0.001)
+
         gc.enable()
         gc.collect()
         # ══ END CRITICAL ══
@@ -578,7 +586,7 @@ class ConnectElec(BaseTask):
             f"{dur:.3f} s | {n_deliv} stim  {n_omit} omit"
         )
         return records
-
+    
     def _run_off_block(
         self,
         block_index: int,
@@ -719,12 +727,21 @@ class ConnectElec(BaseTask):
                 self.EyeTracker.send_message("END_EXP")
                 self.EyeTracker.close_and_transfer_data(self.data_dir)
 
-            self.save_data(
+            saved_path = self.save_data(
                 data_list=self.global_records,
                 filename_suffix=(
                     f"_{self.run_type}_run{self.run_number:02d}"
                 ),
             )
+
+            if saved_path and os.path.exists(saved_path):
+                try:
+                    from tasks.qc.qc_connectelec import qc_connectelec
+                    qc_connectelec(saved_path)
+                except ImportError:
+                    self.logger.warn("QC module not found (non bloquant)")
+                except Exception as qc_exc:
+                    self.logger.warn(f"QC échoué (non bloquant) : {qc_exc}")
 
             if finished:
                 self.show_instructions(
