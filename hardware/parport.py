@@ -30,30 +30,30 @@ class ParPort:
 
     import time
 
-def send_trigger(self, code, duration=0.0005):
-    """
-    Envoie un trigger sur le port parallèle avec une durée sub-ms.
-    duration : durée du pulse en secondes (ex: 0.0005 = 0.5 ms)
-    """
+    def send_trigger(self, code, duration=0.0005):
+        """
+        Envoie un trigger sur le port parallèle avec une durée sub-ms.
+        duration : durée du pulse en secondes (ex: 0.0005 = 0.5 ms)
+        """
 
-    if self.dummy_mode:
-        return
+        if self.dummy_mode:
+            return
 
-    try:
-        start = time.perf_counter()
+        try:
+            start = time.perf_counter()
 
-        # front montant
-        self.port.setData(int(code))
+            # front montant
+            self.port.setData(int(code))
 
-        # busy wait haute précision
-        while (time.perf_counter() - start) < duration:
-            pass
+            # busy wait haute précision
+            while (time.perf_counter() - start) < duration:
+                pass
 
-        # remise à 0
-        self.port.setData(0)
+            # remise à 0
+            self.port.setData(0)
 
-    except Exception as e:
-        print(f"Erreur envoi trigger {code}: {e}")
+        except Exception as e:
+            print(f"Erreur envoi trigger {code}: {e}")
 
     def reset(self):
         """Force la remise à zéro des pins"""
