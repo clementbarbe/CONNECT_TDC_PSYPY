@@ -4,27 +4,6 @@
 
 Protocole de stimulation électrique digitale en IRMf pour l'étude de la somatotopie corticale et des mécanismes de prédiction sensorielle.
 
----
-
-## Architecture
-
-project/
-├── tasks/
-│   └── stimulation_electrique.py    # Tâche principale
-├── gui/
-│   └── tabs/
-│       └── stimulation_electrique_tab.py  # Onglet GUI (PyQt6)
-├── utils/
-│   ├── base_task.py                 # Classe mère
-│   ├── hardware_manager.py          # Gestion port parallèle + eye-tracker
-│   ├── logger.py                    # Logging
-│   └── task_factory.py             # Factory (create_task)
-├── data/
-│   └── stimulation_electrique/      # Données sauvegardées (CSV)
-└── README.md
-
----
-
 ## Protocole
 
 ### Phase 1 — Finger Mapping
@@ -41,7 +20,6 @@ Cartographie somatotopique par block design ON/OFF.
 | Stims par doigt par bloc| 5                 |
 | Total stims par bloc ON | 20                |
 | ISI (inter-stim)        | 500 ms            |
-| Durée impulsion         | 1 ms              |
 | Séquence                | Pseudo-aléatoire  |
 | Durée estimée           | ~6 min 40 s       |
 
