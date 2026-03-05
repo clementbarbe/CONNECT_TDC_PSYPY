@@ -1,703 +1,757 @@
-# stimulation_electrique.py
+# connectelec.py
 """
 Stimulation Électrique — Somatotopie Digitale & Tâche de Prédiction
 ====================================================================
-Phase 1 : Finger Mapping  — blocs ON/OFF, stimulation pseudo-aléatoire D1–D4
-Phase 2 : Prediction Task — 4 conditions (FP, TP, FR, TR)
+7T laminar fMRI — UN run par lancement.
 
-Stimulation déclenchée par front montant sur pins du port parallèle.
+Mapping run :
+    N blocs ON/OFF, pseudo-random D1–D4
+
+Prediction run :
+    20 blocs (5 reps × 4 conditions, pseudo-randomisés)
+    Bloc = Instruction (5 s ± 1 s) → ON (10 s) → OFF (10 s)
+
+Hardware — front montant sur port parallèle :
+    D1 → 0x02   D2 → 0x04   D3 → 0x08   D4 → 0x10
+    Le stimulateur gère le pulse en interne.
 """
 
-import random
+from __future__ import annotations
+
 import gc
-import os
-from psychopy import visual, core
+import random
+from typing import Any, Dict, List, Optional
+
+from psychopy import core, visual
 from utils.base_task import BaseTask
 
+# ═════════════════════════════════════════════════════════════════════════════
+# CONSTANTS
+# ═════════════════════════════════════════════════════════════════════════════
 
-# Mapping doigts → pin data bits du port parallèle
-FINGER_PIN_MAP = {
-    'D1': 0x01,   # Pin D0
-    'D2': 0x02,   # Pin D1
-    'D3': 0x04,   # Pin D2
-    'D4': 0x08,   # Pin D3
+FINGER_PIN_MAP: Dict[str, int] = {
+    "D1": 0x02,
+    "D2": 0x04,
+    "D3": 0x08,
+    "D4": 0x10,
 }
 
-FINGERS_4 = ['D1', 'D2', 'D3', 'D4']
-PREDICTABLE_ORDER = ['D1', 'D2', 'D3', 'D4']
+FINGERS_4: List[str]          = ["D1", "D2", "D3", "D4"]
+PREDICTABLE_ORDER: List[str]  = ["D1", "D2", "D3", "D4"]
+PREDICTION_CONDITIONS: List[str] = ["FP", "TP", "FR", "TR"]
+OMISSION_FINGER: str          = "D4"
 
+# ═════════════════════════════════════════════════════════════════════════════
 
 class ConnectElec(BaseTask):
     """
-    Tâche de stimulation électrique digitale en IRMf.
+    One run per instantiation.
+    run_type = 'mapping' or 'prediction'
+    run_number = integer assigned from the GUI.
     """
 
-    def __init__(self, win, nom, session='01', mode='fmri', run_type='full',
-                 n_blocks_on=20,
-                 stims_per_finger=5,
-                 stim_interval_ms=500,
-                 stim_duration_ms=1,
-                 block_off_duration=10.0,
-                 block_off_jitter=5.0,
-                 pause_between_phases=180.0,
-                 pause_between_blocks=180.0,
-                 prediction_block_order=None,
-                 enregistrer=True, eyetracker_actif=False, parport_actif=True,
-                 **kwargs):
+    def __init__(
+        self,
+        win: visual.Window,
+        nom: str,
+        session: str = "01",
+        mode: str = "fmri",
+        run_type: str = "mapping",
+        run_number: int = 1,
+        # ── mapping ──
+        n_mapping_blocks: int = 20,
+        mapping_off_jitter: float = 0.0,
+        # ── prediction ──
+        n_reps_per_condition: int = 5,
+        # ── stimulation timing ──
+        stims_per_finger: int = 5,
+        stim_interval_ms: float = 500.0,
+        # ── block timing ──
+        block_on_duration: float = 10.0,
+        block_off_duration: float = 10.0,
+        instruction_duration: float = 5.0,
+        instruction_jitter: float = 1.0,
+        # ── pauses ──
+        initial_baseline: float = 10.0,
+        # ── misc ──
+        prediction_conditions: Optional[List[str]] = None,
+        enregistrer: bool = True,
+        eyetracker_actif: bool = False,
+        parport_actif: bool = True,
+        **kwargs: Any,
+    ) -> None:
 
         super().__init__(
             win=win,
             nom=nom,
             session=session,
-            task_name="Stimulation Electrique",
+            task_name="Stimulation_Electrique",
             folder_name="stimulation_electrique",
             eyetracker_actif=eyetracker_actif,
             parport_actif=parport_actif,
             enregistrer=enregistrer,
-            et_prefix='SE'
+            et_prefix="SE",
         )
 
-        self.mode = mode.lower()
-        self.run_type = run_type.lower()
+        # ── identifiers ──────────────────────────────────────────────────
+        self.mode: str       = mode.lower()
+        self.run_type: str   = run_type.lower()
+        self.run_number: int = run_number
 
-        self.n_blocks_on = n_blocks_on
-        self.stims_per_finger = stims_per_finger
-        self.stim_interval_s = stim_interval_ms / 1000.0
-        self.stim_duration_s = stim_duration_ms / 1000.0
-        self.block_off_duration = block_off_duration
-        self.block_off_jitter = block_off_jitter
-        self.pause_between_phases = pause_between_phases
-        self.pause_between_blocks = pause_between_blocks
+        # ── mapping ───────────────────────────────────────────────────────
+        self.n_mapping_blocks: int     = n_mapping_blocks
+        self.mapping_off_jitter: float = mapping_off_jitter
 
-        self.prediction_block_order = prediction_block_order or ['FP', 'TP', 'FR', 'TR']
-        self.finger_pin_map = dict(FINGER_PIN_MAP)
+        # ── prediction ────────────────────────────────────────────────────
+        self.n_reps_per_condition: int = n_reps_per_condition
+        self.n_blocks_per_run: int = (
+            len(PREDICTION_CONDITIONS) * n_reps_per_condition
+        )
+        self.prediction_conditions: List[str] = (
+            prediction_conditions or list(PREDICTION_CONDITIONS)
+        )
 
-        # Durée d'un bloc ON = n_doigts × stims_per_finger × ISI
-        self.n_stims_per_block = len(FINGERS_4) * self.stims_per_finger
-        self.block_on_duration = self.n_stims_per_block * self.stim_interval_s
+        # ── stim timing ──────────────────────────────────────────────────
+        self.stims_per_finger: int  = stims_per_finger
+        self.stim_interval_s: float = stim_interval_ms / 1000.0
+        self.n_stims_per_block: int = len(FINGERS_4) * stims_per_finger
 
-        self.global_records = []
-        self.current_trial_idx = 0
-        self.current_phase = 'setup'
+        # ── block timing ─────────────────────────────────────────────────
+        self.block_on_duration: float    = block_on_duration
+        self.block_off_duration: float   = block_off_duration
+        self.instruction_duration: float = instruction_duration
+        self.instruction_jitter: float   = instruction_jitter
+        self.initial_baseline: float     = initial_baseline
 
+        # ── hardware ──────────────────────────────────────────────────────
+        self.finger_pin_map: Dict[str, int] = dict(FINGER_PIN_MAP)
+
+        # ── runtime state ─────────────────────────────────────────────────
+        self.global_records: List[Dict[str, Any]] = []
+        self.current_trial_idx: int = 0
+        self.current_phase: str     = self.run_type
+
+        # ── init chain ────────────────────────────────────────────────────
         self._detect_display_scaling()
         self._measure_frame_rate()
         self._define_ttl_codes()
         self._setup_key_mapping()
-        self._setup_task_stimuli()
-        self._init_incremental_file(suffix=f"_{self.run_type}")
+        self._setup_visual_stimuli()
+        self._init_incremental_file(
+            suffix=f"_{self.run_type}_run{self.run_number:02d}"
+        )
+        self._validate_timing()
 
         self.logger.ok(
-            f"StimulationElectrique init | Mode: {self.run_type} | "
-            f"Frame Rate: {self.frame_rate:.2f} Hz | "
-            f"Blocks ON: {self.n_blocks_on} | "
-            f"Stims/finger/block: {self.stims_per_finger} | "
-            f"ISI: {self.stim_interval_s*1000:.0f}ms | "
-            f"Block ON: {self.block_on_duration:.1f}s"
+            f"ConnectElec ready | {self.run_type} "
+            f"run {self.run_number:02d} | "
+            f"{self.frame_rate:.1f} Hz | "
+            f"{self.n_stims_per_block} stim/blk @ "
+            f"{self.stim_interval_s * 1000:.0f} ms ISI"
         )
 
-    # =========================================================================
-    # INITIALISATION
-    # =========================================================================
+    # ─────────────────────────────────────────────────────────────────────
+    # INIT HELPERS
+    # ─────────────────────────────────────────────────────────────────────
 
-    def _detect_display_scaling(self):
-        if self.win.size[1] > 1200:
-            self.pixel_scale = 2.0
-            self.logger.log(f"High-res display ({self.win.size}). Scale: x2.0")
-        else:
-            self.pixel_scale = 1.0
-            self.logger.log(f"Standard display ({self.win.size}). Scale: x1.0")
+    def _detect_display_scaling(self) -> None:
+        self.pixel_scale = 2.0 if self.win.size[1] > 1200 else 1.0
 
-    def _measure_frame_rate(self):
-        self.logger.log("Measuring frame rate...")
-        self.frame_rate = self.win.getActualFrameRate(
+    def _measure_frame_rate(self) -> None:
+        measured = self.win.getActualFrameRate(
             nIdentical=10, nMaxFrames=100, threshold=1
         )
-        if self.frame_rate is None:
-            self.frame_rate = 60.0
-            self.logger.warn("Frame rate not detected, defaulting to 60.0 Hz")
-        else:
-            self.logger.ok(f"Frame rate: {self.frame_rate:.2f} Hz")
-
-        self.frame_duration_s = 1.0 / self.frame_rate
+        self.frame_rate = measured if measured else 60.0
+        self.frame_duration_s  = 1.0 / self.frame_rate
         self.frame_tolerance_s = 0.75 / self.frame_rate
-        self.logger.log(f"Frame tolerance: {self.frame_tolerance_s * 1000:.2f} ms")
 
-    def _define_ttl_codes(self):
-        self.codes = {
-            'start_exp': 255,
-            'end_exp': 254,
-            'rest_start': 200,
-            'rest_end': 201,
-            'mapping_start': 210,
-            'mapping_end': 211,
-            'prediction_start': 220,
-            'prediction_end': 221,
-            'block_on_start': 100,
-            'block_on_end': 101,
-            'block_off_start': 110,
-            'block_off_end': 111,
-            'stim_D1': 11,
-            'stim_D2': 12,
-            'stim_D3': 13,
-            'stim_D4': 14,
-            'stim_omission': 15,
-            'condition_FP': 50,
-            'condition_TP': 51,
-            'condition_FR': 52,
-            'condition_TR': 53,
-            'pause_start': 120,
-            'pause_end': 121,
-        }
-
-    def _setup_key_mapping(self):
-        if self.mode == 'fmri':
-            self.key_trigger = 't'
-            self.key_continue = 'b'
-        else:
-            self.key_trigger = 't'
-            self.key_continue = 'space'
-
-    def _setup_task_stimuli(self):
-        # Tâche passive : uniquement la croix de fixation (déjà dans BaseTask)
-        self.logger.log("Stimuli loaded (fixation cross only — passive task).")
-
-    # =========================================================================
-    # LOGGING
-    # =========================================================================
-
-    def log_trial_event(self, event_type, **kwargs):
-        current_time = self.task_clock.getTime()
-
-        if self.eyetracker_actif:
-            self.EyeTracker.send_message(
-                f"PHASE_{self.current_phase.upper()}_"
-                f"STIM_{self.current_trial_idx:03d}_{event_type.upper()}"
+    def _validate_timing(self) -> None:
+        expected_on = self.n_stims_per_block * self.stim_interval_s
+        if abs(expected_on - self.block_on_duration) > 0.1:
+            self.logger.warn(
+                f"TIMING: {self.n_stims_per_block} stim × "
+                f"{self.stim_interval_s * 1000:.0f} ms = "
+                f"{expected_on:.1f} s ≠ "
+                f"block_on {self.block_on_duration:.1f} s"
             )
 
-        entry = {
-            'participant': self.nom,
-            'session': self.session,
-            'phase': self.current_phase,
-            'stim_index': self.current_trial_idx,
-            'time_s': round(current_time, 6),
-            'event_type': event_type
+        if self.run_type == "mapping":
+            n = self.n_mapping_blocks
+            dur = self.initial_baseline + n * (
+                self.block_on_duration + self.block_off_duration
+            )
+        else:
+            n = self.n_blocks_per_run
+            dur = self.initial_baseline + n * (
+                self.instruction_duration
+                + self.block_on_duration
+                + self.block_off_duration
+            )
+
+        self.logger.log(
+            f"Run {self.run_number:02d} ({self.run_type}) | "
+            f"{n} blocs | ~{dur:.0f} s ({dur / 60:.1f} min)"
+        )
+
+    # ─────────────────────────────────────────────────────────────────────
+    # TTL CODES
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _define_ttl_codes(self) -> None:
+        self.codes: Dict[str, int] = {
+            "start_exp":         255,
+            "end_exp":           254,
+            "rest_start":        200,
+            "rest_end":          201,
+            "run_start":         230,
+            "run_end":           231,
+            "instruction_start": 120,
+            "instruction_end":   121,
+            "block_on_start":    100,
+            "block_on_end":      101,
+            "block_off_start":   110,
+            "block_off_end":     111,
+            "stim_D1":            11,
+            "stim_D2":            12,
+            "stim_D3":            13,
+            "stim_D4":            14,
+            "stim_omission":      15,
+            "condition_FP":       50,
+            "condition_TP":       51,
+            "condition_FR":       52,
+            "condition_TR":       53,
+            "condition_mapping":  54,
+        }
+
+    # ─────────────────────────────────────────────────────────────────────
+    # KEYS
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _setup_key_mapping(self) -> None:
+        if self.mode == "fmri":
+            self.key_trigger  = "t"
+            self.key_continue = "b"
+        else:
+            self.key_trigger  = "t"
+            self.key_continue = "space"
+
+    # ─────────────────────────────────────────────────────────────────────
+    # VISUAL
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _setup_visual_stimuli(self) -> None:
+        self.cue_stim = visual.TextStim(
+            self.win,
+            text="",
+            height=0.06,  # Taille légèrement réduite pour les phrases longues
+            color="white",
+            pos=(0.0, 0.25),
+            wrapWidth=1.6,  # Plus large pour éviter de couper les mots
+            font="Arial",
+            bold=True,
+        )
+        
+        self.condition_cues: Dict[str, str] = {
+            "FP": (
+                "Faites attention à la stimulation de chaque doigt et prédisez\n"
+                "quand l'index sera stimulé selon le rythme temporel."
+            ),
+            "TP": (
+                "Faites attention à la stimulation de chaque doigt et prédisez\n"
+                "quand l'index sera stimulé, même si aucune stimulation n'est délivrée."
+            ),
+            "FR": (
+                "Faites attention à la stimulation de chaque doigt,\n"
+                "mais n'essayez pas de prédire un motif rythmique ou temporel."
+            ),
+            "TR": (
+                "Faites attention à la stimulation de chaque doigt,\n"
+                "mais n'essayez pas de prédire un motif rythmique ou temporel."
+            ),
+        }
+
+        self._setup_condition_images()
+
+    def _setup_condition_images(self) -> None:
+        from pathlib import Path
+
+        self.condition_image_paths = {
+            "FP": "image/fp.png",
+            "TP": "image/fp.png",
+            "FR": "image/fr.png",
+            "TR": "image/fr.png",
+        }
+
+        self.condition_images_stim = {}
+
+        for cond, path in self.condition_image_paths.items():
+            if Path(path).exists():
+                self.condition_images_stim[cond] = visual.ImageStim(
+                    self.win,
+                    image=path,
+                    size=(0.5*0.7, 0.7*0.7),
+                    pos=(0, -0.5)
+                )
+
+    # ═════════════════════════════════════════════════════════════════════
+    # EVENT LOGGING
+    # ═════════════════════════════════════════════════════════════════════
+
+    def log_trial_event(self, event_type: str, **kwargs: Any) -> None:
+        t = self.task_clock.getTime()
+        if self.eyetracker_actif:
+            self.EyeTracker.send_message(
+                f"R{self.run_number:02d}_"
+                f"{self.current_phase.upper()}_"
+                f"S{self.current_trial_idx:03d}_"
+                f"{event_type.upper()}"
+            )
+        entry: Dict[str, Any] = {
+            "participant": self.nom,
+            "session":     self.session,
+            "run_type":    self.run_type,
+            "run_number":  self.run_number,
+            "phase":       self.current_phase,
+            "stim_index":  self.current_trial_idx,
+            "time_s":      round(t, 6),
+            "event_type":  event_type,
         }
         entry.update(kwargs)
         self.global_records.append(entry)
 
-    # =========================================================================
-    # STIMULATION ÉLECTRIQUE — CONTRÔLE HARDWARE
-    # =========================================================================
+    # ═════════════════════════════════════════════════════════════════════
+    # ELECTRICAL STIMULATION — FRONT MONTANT
+    # ═════════════════════════════════════════════════════════════════════
 
-    def send_stim_pulse(self, finger, is_omission=False):
+    def _send_stim_pulse(
+        self, finger: str, is_omission: bool = False
+    ) -> Dict[str, Any]:
         """
-        Envoie une stimulation électrique via front montant sur le port parallèle.
-        Busy-wait pour garantir la durée de 1ms.
+        Front montant sur le port parallèle.
+        Le stimulateur détecte le front et gère le pulse.
         """
-        t_before = self.task_clock.getTime()
+        t_now = self.task_clock.getTime()
 
         if is_omission:
-            # Slot temporel conservé, pas de stimulation
-            self.ParPort.send_trigger(self.codes['stim_omission'])
-            t_after = self.task_clock.getTime()
             return {
-                'finger': finger,
-                'is_omission': True,
-                'pin_code': 0,
-                'time_s': round(t_before, 6),
-                'timing_error_ms': 0.0,
+                "finger":      finger,
+                "is_omission": True,
+                "pin_code":    0,
+                "time_s":      round(t_now, 6),
             }
 
         pin_code = self.finger_pin_map.get(finger, 0)
-        ttl_code = self.codes.get(f'stim_{finger}', 0)
+        ttl_code = self.codes.get(f"stim_{finger}", 0)
 
-        # Front montant
+        # ── Front montant → reset immédiat ──
         try:
-            if hasattr(self.ParPort, 'port') and self.ParPort.port is not None:
-                self.ParPort.port.setData(pin_code)
-                t0 = core.getTime()
-                while core.getTime() < t0 + self.stim_duration_s:
-                    pass
-                self.ParPort.port.setData(0)
+            port = getattr(self.ParPort, "port", None)
+            if port is not None:
+                port.setData(pin_code)       # front montant
+                t_sent = self.task_clock.getTime()
+                port.setData(0x00)           # reset
             else:
-                self.ParPort.send_trigger(pin_code, duration=self.stim_duration_s)
+                self.ParPort.send_trigger(pin_code)
+                t_sent = self.task_clock.getTime()
         except Exception:
-            self.ParPort.send_trigger(pin_code, duration=self.stim_duration_s)
-
-        t_after = self.task_clock.getTime()
-
-        # TTL event marker après le pulse
-        self.ParPort.send_trigger(ttl_code)
+            self.ParPort.send_trigger(pin_code)
+            t_sent = self.task_clock.getTime()
 
         return {
-            'finger': finger,
-            'is_omission': False,
-            'pin_code': pin_code,
-            'time_s': round(t_after, 6),
-            'timing_error_ms': round((t_after - t_before) * 1000 - self.stim_duration_s * 1000, 3),
+            "finger":      finger,
+            "is_omission": False,
+            "pin_code":    pin_code,
+            "time_s":      round(t_sent, 6),
         }
 
-    # =========================================================================
-    # GÉNÉRATION DE SÉQUENCES
-    # =========================================================================
+    # ═════════════════════════════════════════════════════════════════════
+    # SEQUENCE GENERATION
+    # ═════════════════════════════════════════════════════════════════════
 
-    def build_pseudo_random_sequence(self, fingers, stims_per_finger):
-        """
-        Séquence pseudo-aléatoire : pas de répétition consécutive,
-        chaque doigt exactement stims_per_finger fois.
-        """
-        pool = []
-        for f in fingers:
-            pool.extend([f] * stims_per_finger)
-
-        for _attempt in range(100):
-            sequence = []
-            remaining = pool[:]
-            random.shuffle(remaining)
-            success = True
-
-            while remaining:
-                if sequence:
-                    candidates = [f for f in remaining if f != sequence[-1]]
-                else:
-                    candidates = remaining[:]
-
+    @staticmethod
+    def _pseudo_random_no_repeat(
+        items: List[str], reps: int, max_attempts: int = 500
+    ) -> List[str]:
+        pool = [it for it in items for _ in range(reps)]
+        for _ in range(max_attempts):
+            seq: List[str] = []
+            bag = pool[:]
+            random.shuffle(bag)
+            ok = True
+            while bag:
+                candidates = (
+                    [x for x in bag if x != seq[-1]] if seq else bag[:]
+                )
                 if not candidates:
-                    success = False
+                    ok = False
                     break
-
                 chosen = random.choice(candidates)
-                sequence.append(chosen)
-                remaining.remove(chosen)
-
-            if success and len(sequence) == len(pool):
-                return sequence
-
-        self.logger.warn("Pseudo-random constraints failed. Using simple shuffle.")
+                seq.append(chosen)
+                bag.remove(chosen)
+            if ok and len(seq) == len(pool):
+                return seq
         random.shuffle(pool)
         return pool
 
-    def build_predictable_sequence(self, fingers, stims_per_finger):
-        """Séquence cyclique fixe : D1,D2,D3,D4,D1,D2,..."""
-        total = len(fingers) * stims_per_finger
-        return [fingers[i % len(fingers)] for i in range(total)]
+    def _build_predictable_seq(self) -> List[str]:
+        total = len(FINGERS_4) * self.stims_per_finger
+        return [
+            PREDICTABLE_ORDER[i % len(PREDICTABLE_ORDER)]
+            for i in range(total)
+        ]
 
-    def build_block_sequence(self, condition):
-        """
-        Construit la séquence de stim pour un bloc ON selon la condition.
+    def _build_random_seq(self) -> List[str]:
+        return self._pseudo_random_no_repeat(FINGERS_4, self.stims_per_finger)
 
-        Returns:
-            list[dict]: [{finger, is_omission}, ...]
-        """
-        if condition == 'mapping':
-            raw = self.build_pseudo_random_sequence(FINGERS_4, self.stims_per_finger)
-            return [{'finger': f, 'is_omission': False} for f in raw]
+    def _build_block_stim_list(
+        self, condition: str
+    ) -> List[Dict[str, Any]]:
+        if condition in ("mapping", "FR"):
+            raw = self._build_random_seq()
+            return [{"finger": f, "is_omission": False} for f in raw]
 
-        elif condition == 'FP':
-            raw = self.build_predictable_sequence(PREDICTABLE_ORDER, self.stims_per_finger)
-            return [{'finger': f, 'is_omission': False} for f in raw]
+        if condition == "FP":
+            raw = self._build_predictable_seq()
+            return [{"finger": f, "is_omission": False} for f in raw]
 
-        elif condition == 'TP':
-            raw = self.build_predictable_sequence(PREDICTABLE_ORDER, self.stims_per_finger)
-            return [{'finger': f, 'is_omission': (f == 'D4')} for f in raw]
+        if condition == "TP":
+            raw = self._build_predictable_seq()
+            return [
+                {"finger": f, "is_omission": f == OMISSION_FINGER}
+                for f in raw
+            ]
 
-        elif condition == 'FR':
-            raw = self.build_pseudo_random_sequence(FINGERS_4, self.stims_per_finger)
-            return [{'finger': f, 'is_omission': False} for f in raw]
+        if condition == "TR":
+            raw = self._build_random_seq()
+            return [
+                {"finger": f, "is_omission": f == OMISSION_FINGER}
+                for f in raw
+            ]
 
-        elif condition == 'TR':
-            raw = self.build_pseudo_random_sequence(FINGERS_4, self.stims_per_finger)
-            return [{'finger': f, 'is_omission': (f == 'D4')} for f in raw]
+        self.logger.err(f"Unknown condition '{condition}'")
+        return []
 
-        else:
-            self.logger.err(f"Unknown condition: {condition}")
-            return []
+    def _build_run_block_order(self) -> List[str]:
+        return self._pseudo_random_no_repeat(
+            self.prediction_conditions, self.n_reps_per_condition
+        )
 
-    # =========================================================================
-    # CORE TASK LOGIC
-    # =========================================================================
+    # ═════════════════════════════════════════════════════════════════════
+    # BLOCK EXECUTORS
+    # ═════════════════════════════════════════════════════════════════════
 
-    def run_on_block(self, block_index, total_blocks, condition):
-        """
-        Exécute un bloc ON complet avec timing sub-milliseconde.
-        """
+    def _run_instruction_cue(
+        self, condition: str, block_index: int
+    ) -> float:
         self.should_quit()
 
-        stim_sequence = self.build_block_sequence(condition)
-        n_stims = len(stim_sequence)
-
-        self.log_trial_event(
-            'block_on_start', condition=condition,
-            block_index=block_index, n_stims=n_stims
+        jitter   = random.uniform(
+            -self.instruction_jitter, self.instruction_jitter
         )
-        self.ParPort.send_trigger(self.codes['block_on_start'])
+        duration = max(2.0, self.instruction_duration + jitter)
 
-        self.fixation.draw()
-        self.win.flip()
+        cond_ttl = self.codes.get(f"condition_{condition}", 0)
 
-        # =================================================================
-        # CRITICAL TIMING: DISABLE GC
-        # =================================================================
-        gc.disable()
-
-        t_block_start = self.task_clock.getTime()
-        block_records = []
-
-        for stim_idx, stim_info in enumerate(stim_sequence):
-            self.current_trial_idx = stim_idx
-
-            # Timing cible pour cette stimulation
-            t_target = t_block_start + (stim_idx * self.stim_interval_s)
-
-            # Busy-wait jusqu'au moment précis
-            while self.task_clock.getTime() < (t_target - 0.0001):
-                pass
-
-            # Stimulation
-            stim_record = self.send_stim_pulse(
-                finger=stim_info['finger'],
-                is_omission=stim_info['is_omission']
-            )
-
-            stim_record.update({
-                'condition': condition,
-                'block_index': block_index,
-                'stim_index_in_block': stim_idx,
-                'target_time_s': round(t_target, 6),
-            })
-            block_records.append(stim_record)
-
-            self.log_trial_event(
-                'stim_omission' if stim_info['is_omission'] else 'stim_delivered',
-                finger=stim_info['finger'],
-                is_omission=stim_info['is_omission'],
-                target_time_s=round(t_target, 6),
-                actual_time_s=stim_record['time_s'],
-                timing_error_ms=stim_record['timing_error_ms']
-            )
-
-            # Sauvegarde incrémentale
-            trial_summary = {
-                'participant': self.nom,
-                'session': self.session,
-                'phase': self.current_phase,
-                'condition': condition,
-                'block_index': block_index,
-                'block_type': 'ON',
-                'stim_index': stim_idx,
-                'finger': stim_info['finger'],
-                'is_omission': stim_info['is_omission'],
-                'pin_code': stim_record.get('pin_code', 0),
-                'time_s': stim_record['time_s'],
-                'target_time_s': round(t_target, 6),
-                'timing_error_ms': stim_record['timing_error_ms'],
-            }
-            self.save_trial_incremental(trial_summary)
-
-            # Warning si timing dérape
-            t_now = self.task_clock.getTime()
-            error_ms = (t_now - t_target) * 1000
-            if abs(error_ms) > 2.0:
-                self.logger.warn(
-                    f"TIMING WARNING Block {block_index}, Stim {stim_idx} "
-                    f"({stim_info['finger']}): error={error_ms:.2f}ms"
-                )
-
-        # =================================================================
-        # CRITICAL TIMING END: RE-ENABLE GC
-        # =================================================================
-        gc.enable()
-        gc.collect()
-
-        t_block_end = self.task_clock.getTime()
-        actual_duration = t_block_end - t_block_start
-
-        self.ParPort.send_trigger(self.codes['block_on_end'])
         self.log_trial_event(
-            'block_on_end', condition=condition,
+            "instruction_start",
+            condition=condition,
             block_index=block_index,
-            actual_duration_s=round(actual_duration, 4),
-            n_stims_delivered=sum(1 for r in block_records if not r['is_omission']),
-            n_omissions=sum(1 for r in block_records if r['is_omission'])
+            duration_planned_s=round(duration, 3),
         )
 
-        omissions = sum(1 for r in block_records if r['is_omission'])
-        delivered = len(block_records) - omissions
-        self.logger.log(
-            f"Block ON {block_index:>2}/{total_blocks:<2} | "
-            f"{condition:<7} | Duration: {actual_duration:.3f}s | "
-            f"Stims: {delivered} delivered, {omissions} omissions"
-        )
-
-        return block_records
-
-    def run_off_block(self, block_index):
-        """
-        Exécute un bloc OFF (repos) avec jitter ±5s.
-        """
-        self.should_quit()
-
-        jitter = random.uniform(-self.block_off_jitter, self.block_off_jitter)
-        duration = max(1.0, self.block_off_duration + jitter)
-
-        self.log_trial_event(
-            'block_off_start', block_index=block_index,
-            planned_duration_s=round(duration, 3), jitter_s=round(jitter, 3)
-        )
-        self.ParPort.send_trigger(self.codes['block_off_start'])
-
+        self.cue_stim.text = self.condition_cues.get(condition, condition)
+        self.cue_stim.draw()
+        img = self.condition_images_stim.get(condition)
+        if img:
+            img.draw()
         self.fixation.draw()
         self.win.flip()
         core.wait(duration)
 
-        self.ParPort.send_trigger(self.codes['block_off_end'])
-        self.log_trial_event('block_off_end', block_index=block_index)
-
-        self.logger.log(
-            f"Block OFF {block_index:>2} | "
-            f"Duration: {duration:.1f}s (jitter: {jitter:+.1f}s)"
+        self.log_trial_event(
+            "instruction_end",
+            condition=condition,
+            block_index=block_index,
         )
-
         return duration
 
-    def run_block_series(self, n_blocks, condition, series_name):
-        """
-        Alterne n blocs ON/OFF pour une condition donnée.
-        """
+    def _run_on_block(
+        self, block_index: int, total_blocks: int, condition: str
+    ) -> List[Dict[str, Any]]:
+        self.should_quit()
+
+        stim_seq = self._build_block_stim_list(condition)
+        n_stims  = len(stim_seq)
+
         self.log_trial_event(
-            'series_start', series_name=series_name,
-            condition=condition, n_blocks=n_blocks
-        )
-        self.logger.log(f"--- Series Start: {series_name} ({n_blocks} ON blocks) ---")
-
-        for block_idx in range(1, n_blocks + 1):
-            self.run_on_block(block_idx, n_blocks, condition)
-
-            if block_idx < n_blocks:
-                self.run_off_block(block_idx)
-
-        self.log_trial_event('series_end', series_name=series_name)
-        self.logger.log(f"--- Series End: {series_name} ---")
-
-    # =========================================================================
-    # PHASE 1 : FINGER MAPPING
-    # =========================================================================
-
-    def run_finger_mapping(self):
-        self.current_phase = 'finger_mapping'
-        self.logger.log("=" * 50)
-        self.logger.log("  PHASE 1 : FINGER MAPPING")
-        self.logger.log("=" * 50)
-
-        self.ParPort.send_trigger(self.codes['mapping_start'])
-        self.log_trial_event('mapping_start', n_blocks=self.n_blocks_on)
-
-        self.run_block_series(
-            n_blocks=self.n_blocks_on,
-            condition='mapping',
-            series_name='FINGER_MAPPING'
+            "block_on_start",
+            condition=condition,
+            block_index=block_index,
+            n_stims=n_stims,
         )
 
-        self.ParPort.send_trigger(self.codes['mapping_end'])
-        self.log_trial_event('mapping_end')
-        self.logger.ok("Finger Mapping complete.")
-
-    # =========================================================================
-    # PHASE 2 : PREDICTION TASK
-    # =========================================================================
-
-    def show_condition_instruction(self, condition):
-        instructions = {
-            'FP': (
-                "Condition : 4 doigts — Séquence prédictible\n\n"
-                "Portez attention à la stimulation de chaque doigt et\n"
-                "prédisez quand votre index sera stimulé\n"
-                "en vous basant sur le rythme temporel.\n\n"
-                "Fixez la croix. Appuyez pour continuer."
-            ),
-            'TP': (
-                "Condition : 3 doigts — Séquence prédictible\n\n"
-                "Portez attention à la stimulation de chaque doigt et\n"
-                "prédisez quand l'index sera stimulé,\n"
-                "même si aucune stimulation réelle n'a lieu.\n\n"
-                "Fixez la croix. Appuyez pour continuer."
-            ),
-            'FR': (
-                "Condition : 4 doigts — Séquence aléatoire\n\n"
-                "Portez attention à la stimulation de chaque doigt.\n"
-                "N'essayez pas de prédire un quelconque motif.\n\n"
-                "Fixez la croix. Appuyez pour continuer."
-            ),
-            'TR': (
-                "Condition : 3 doigts — Séquence aléatoire\n\n"
-                "Portez attention à la stimulation de chaque doigt.\n"
-                "N'essayez pas de prédire un quelconque motif.\n\n"
-                "Fixez la croix. Appuyez pour continuer."
-            ),
-        }
-
-        text = instructions.get(condition, "Préparez-vous. Appuyez pour continuer.")
-        self.log_trial_event('instruction_shown', condition=condition)
-        self.show_instructions(text)
-
-    def show_pause_screen(self, duration_label):
-        self.log_trial_event('pause_start')
-        self.ParPort.send_trigger(self.codes['pause_start'])
-
-        text = (
-            f"Pause — {duration_label}\n\n"
-            "L'expérimentateur vérifie que tout va bien.\n"
-            "Appuyez pour continuer quand vous êtes prêt."
-        )
-        self.instr_stim.text = text
-        self.instr_stim.draw()
+        self.fixation.draw()
         self.win.flip()
 
-        core.wait(5.0)
-        self.wait_keys(key_list=[self.key_continue])
+        # ══ CRITICAL TIMING ══
+        gc.disable()
+        t_start = self.task_clock.getTime()
+        records: List[Dict[str, Any]] = []
 
-        self.ParPort.send_trigger(self.codes['pause_end'])
-        self.log_trial_event('pause_end')
+        for si, info in enumerate(stim_seq):
+            self.current_trial_idx = si
 
-    def run_prediction_task(self):
-        self.current_phase = 'prediction'
-        self.logger.log("=" * 50)
-        self.logger.log("  PHASE 2 : PREDICTION TASK")
-        self.logger.log("=" * 50)
+            t_target = t_start + self.block_on_duration
+            remaining = t_target - self.task_clock.getTime()
 
-        self.ParPort.send_trigger(self.codes['prediction_start'])
+            if remaining > 0:
+                core.wait(remaining, hogCPUperiod=0.001)
+
+            rec = self._send_stim_pulse(
+                finger=info["finger"],
+                is_omission=info["is_omission"],
+            )
+            rec.update(
+                condition=condition,
+                block_index=block_index,
+                stim_index_in_block=si,
+                target_time_s=round(t_target, 6),
+            )
+            records.append(rec)
+
+            sched_err_ms = (rec["time_s"] - t_target) * 1000
+
+            self.log_trial_event(
+                "stim_omission" if info["is_omission"] else "stim_delivered",
+                finger=info["finger"],
+                is_omission=info["is_omission"],
+                condition=condition,
+                target_time_s=round(t_target, 6),
+                actual_time_s=rec["time_s"],
+                scheduling_error_ms=round(sched_err_ms, 3),
+            )
+
+            self.save_trial_incremental({
+                "participant":         self.nom,
+                "session":             self.session,
+                "run_type":            self.run_type,
+                "run_number":          self.run_number,
+                "phase":               self.current_phase,
+                "condition":           condition,
+                "block_index":         block_index,
+                "block_type":          "ON",
+                "stim_index":          si,
+                "finger":              info["finger"],
+                "is_omission":         info["is_omission"],
+                "pin_code":            rec.get("pin_code", 0),
+                "time_s":              rec["time_s"],
+                "target_time_s":       round(t_target, 6),
+                "scheduling_error_ms": round(sched_err_ms, 3),
+            })
+
+            if abs(sched_err_ms) > 2.0:
+                self.logger.warn(
+                    f"TIMING B{block_index} S{si} "
+                    f"({info['finger']}): {sched_err_ms:+.2f} ms"
+                )
+
+        gc.enable()
+        gc.collect()
+        # ══ END CRITICAL ══
+
+        t_end = self.task_clock.getTime()
+        dur   = t_end - t_start
+        n_omit  = sum(1 for r in records if r["is_omission"])
+        n_deliv = len(records) - n_omit
+
         self.log_trial_event(
-            'prediction_start',
-            conditions=self.prediction_block_order
+            "block_on_end",
+            condition=condition,
+            block_index=block_index,
+            actual_duration_s=round(dur, 4),
+            n_delivered=n_deliv,
+            n_omissions=n_omit,
         )
 
-        n_conditions = len(self.prediction_block_order)
+        self.logger.log(
+            f"  ON  B{block_index:>2}/{total_blocks:<2}  {condition:<7}  "
+            f"{dur:.3f} s | {n_deliv} stim  {n_omit} omit"
+        )
+        return records
 
-        for cond_idx, condition in enumerate(self.prediction_block_order, 1):
-            self.current_phase = f'prediction_{condition}'
+    def _run_off_block(
+        self,
+        block_index: int,
+        duration: Optional[float] = None,
+        jitter: float = 0.0,
+    ) -> float:
+        self.should_quit()
 
-            # Instruction
-            self.show_condition_instruction(condition)
+        dur = duration if duration is not None else self.block_off_duration
+        j   = random.uniform(-jitter, jitter) if jitter > 0 else 0.0
+        dur = max(1.0, dur + j)
 
-            # TTL condition
-            cond_code = self.codes.get(f'condition_{condition}', 0)
-            self.ParPort.send_trigger(cond_code)
+        self.log_trial_event(
+            "block_off_start",
+            block_index=block_index,
+            duration_planned_s=round(dur, 3),
+        )
 
-            # Blocs ON/OFF pour cette condition
-            self.run_block_series(
-                n_blocks=self.n_blocks_on,
-                condition=condition,
-                series_name=f'PREDICTION_{condition}'
+        self.fixation.draw()
+        self.win.flip()
+        core.wait(dur)
+
+        self.log_trial_event("block_off_end", block_index=block_index)
+        return dur
+
+    # ═════════════════════════════════════════════════════════════════════
+    # RUN EXECUTORS
+    # ═════════════════════════════════════════════════════════════════════
+
+    def _run_mapping(self) -> None:
+        self.current_phase = "mapping"
+        n = self.n_mapping_blocks
+
+        self.logger.log(f"{'=' * 50}")
+        self.logger.log(
+            f"  MAPPING — Run {self.run_number:02d} — {n} blocs"
+        )
+        self.logger.log(f"{'=' * 50}")
+
+        self.log_trial_event("run_start", n_blocks=n)
+
+        for b in range(1, n + 1):
+            self._run_on_block(
+                block_index=b,
+                total_blocks=n,
+                condition="mapping",
+            )
+            self._run_off_block(
+                block_index=b,
+                duration=self.block_off_duration,
+                jitter=0.0,
             )
 
-            self.logger.ok(
-                f"Prediction condition {condition} complete "
-                f"({cond_idx}/{n_conditions})"
+        self.log_trial_event("run_end")
+        self.logger.ok(f"Mapping Run {self.run_number:02d} complete.")
+
+    def _run_prediction(self) -> None:
+        self.current_phase = "prediction"
+        block_order = self._build_run_block_order()
+        n = len(block_order)
+
+        self.logger.log(f"{'=' * 50}")
+        self.logger.log(
+            f"  PREDICTION — Run {self.run_number:02d} — {n} blocs"
+        )
+        self.logger.log(f"  Order: {block_order}")
+        self.logger.log(f"{'=' * 50}")
+
+        self.log_trial_event(
+            "run_start",
+            block_order=str(block_order),
+            n_blocks=n,
+        )
+
+        for b_idx, cond in enumerate(block_order, start=1):
+            self.current_phase = f"prediction_{cond}"
+
+            self._run_instruction_cue(
+                condition=cond,
+                block_index=b_idx,
+            )
+            self._run_on_block(
+                block_index=b_idx,
+                total_blocks=n,
+                condition=cond,
+            )
+            self._run_off_block(
+                block_index=b_idx,
+                duration=self.block_off_duration,
+                jitter=0.0,
             )
 
-            # Pause entre conditions (sauf après la dernière)
-            if cond_idx < n_conditions:
-                minutes = self.pause_between_blocks / 60
-                self.show_pause_screen(
-                    duration_label=f"{minutes:.0f} min "
-                                   f"({cond_idx}/{n_conditions - 1})"
-                )
+        self.log_trial_event("run_end")
+        self.logger.ok(f"Prediction Run {self.run_number:02d} complete.")
 
-        self.ParPort.send_trigger(self.codes['prediction_end'])
-        self.log_trial_event('prediction_end')
-        self.logger.ok("Prediction Task complete.")
+    # ═════════════════════════════════════════════════════════════════════
+    # MAIN ENTRY
+    # ═════════════════════════════════════════════════════════════════════
 
-    # =========================================================================
-    # MAIN LOOP
-    # =========================================================================
-
-    def run(self):
-        finished_naturally = False
-        saved_path = None
+    def run(self) -> None:
+        finished = False
 
         try:
-            # Instructions
-            if self.run_type == 'mapping_only':
-                instructions = (
-                    "FINGER MAPPING — Stimulation Électrique\n\n"
-                    "Vous allez recevoir des stimulations électriques\n"
-                    "sur les doigts de la main droite.\n\n"
-                    "Restez immobile et fixez la croix.\n\n"
-                    f"Nombre de blocs : {self.n_blocks_on}\n"
-                    f"Stimulations par bloc : {self.n_stims_per_block}\n\n"
-                    "Appuyez sur une touche pour continuer..."
-                )
-            elif self.run_type == 'prediction_only':
-                instructions = (
-                    "TÂCHE DE PRÉDICTION — Stimulation Électrique\n\n"
-                    "Vous allez recevoir des stimulations électriques\n"
-                    "selon différentes conditions.\n\n"
-                    "Suivez les instructions avant chaque bloc.\n"
-                    "Restez immobile et fixez la croix.\n\n"
-                    f"Conditions : {', '.join(self.prediction_block_order)}\n\n"
-                    "Appuyez sur une touche pour continuer..."
-                )
-            else:
-                instructions = (
-                    "PROTOCOLE COMPLET — Stimulation Électrique\n\n"
-                    "Phase 1 : Finger Mapping\n"
-                    "Phase 2 : Tâche de Prédiction\n\n"
-                    "Restez immobile et fixez la croix.\n\n"
-                    "Appuyez sur une touche pour continuer..."
-                )
-
-            self.show_instructions(instructions)
+            self._show_instructions()
             self.wait_for_trigger()
 
-            if self.run_type in ('full', 'mapping_only'):
-                self.logger.log(
-                    f"Starting: FINGER MAPPING ({self.n_blocks_on} blocks)"
+            # baseline
+            if self.initial_baseline > 0:
+                self.show_resting_state(
+                    duration_s=self.initial_baseline,
+                    code_start_key="rest_start",
+                    code_end_key="rest_end",
                 )
-                self.show_resting_state(duration_s=10.0)
-                self.run_finger_mapping()
 
-                if self.run_type == 'full':
-                    minutes = self.pause_between_phases / 60
-                    self.show_pause_screen(
-                        duration_label=f"{minutes:.0f} min (entre phases)"
-                    )
+            # single run
+            if self.run_type == "mapping":
+                self._run_mapping()
+            else:
+                self._run_prediction()
 
-            if self.run_type in ('full', 'prediction_only'):
-                self.logger.log(
-                    f"Starting: PREDICTION TASK "
-                    f"({self.prediction_block_order})"
-                )
-                if self.run_type == 'prediction_only':
-                    self.show_resting_state(duration_s=10.0)
-                self.run_prediction_task()
-
-            finished_naturally = True
-            self.logger.ok("Task completed successfully.")
+            finished = True
+            self.logger.ok(
+                f"Run {self.run_number:02d} ({self.run_type}) done."
+            )
 
         except (KeyboardInterrupt, SystemExit):
-            self.logger.warn("Manual interruption.")
+            self.logger.warn("Interruption manuelle.")
 
-        except Exception as e:
-            self.logger.err(f"CRITICAL ERROR: {e}")
+        except Exception as exc:
+            self.logger.err(f"CRITICAL: {exc}")
             import traceback
             traceback.print_exc()
             raise
 
         finally:
-            self.logger.log("Final save...")
-
             if self.eyetracker_actif:
                 self.EyeTracker.stop_recording()
                 self.EyeTracker.send_message("END_EXP")
                 self.EyeTracker.close_and_transfer_data(self.data_dir)
 
-            saved_path = self.save_data(
+            self.save_data(
                 data_list=self.global_records,
-                filename_suffix=f"_{self.run_type}"
+                filename_suffix=(
+                    f"_{self.run_type}_run{self.run_number:02d}"
+                ),
             )
 
-            if finished_naturally:
-                end_msg = "Fin de la session.\nMerci pour votre participation."
-                self.show_instructions(end_msg)
+            if finished:
+                self.show_instructions(
+                    f"Run {self.run_number:02d} terminé.\nMerci !"
+                )
                 core.wait(3.0)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # INSTRUCTIONS
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _show_instructions(self) -> None:
+        if self.run_type == "mapping":
+            txt = (
+                f"CARTOGRAPHIE — Run {self.run_number:02d}\n\n"
+                "Faites attention au bout des doigts de la main droite\n"
+                "pendant la phase de stimulation.\n\n"
+                "Maintenez votre regard sur la croix de fixation.\n\n"
+                "En attente du scanner …"
+            )
+        else:
+            txt = (
+                f"TÂCHE DE PRÉDICTION — Run {self.run_number:02d}\n\n"
+                "Faites attention au bout des doigts de la main droite\n"
+                "pendant la phase de stimulation.\n\n"
+                "Des instructions spécifiques s'afficheront avant chaque bloc.\n"
+                "Maintenez votre regard sur la croix de fixation.\n\n"
+                "En attente du scanner …"
+            )
+        self.show_instructions(txt)

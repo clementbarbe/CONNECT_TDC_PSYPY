@@ -262,7 +262,7 @@ class BaseTask:
 
     def _init_common_stimuli(self):
         self.fixation = visual.TextStim(
-            self.win, text='+', height=0.1, color='white'
+            self.win, text='+', height=0.05, color='white'
         )
         self.instr_stim = visual.TextStim(
             self.win, text='', height=0.06, color='white', wrapWidth=1.5
