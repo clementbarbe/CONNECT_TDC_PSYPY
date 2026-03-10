@@ -2,6 +2,11 @@
 """
 QC Dashboard — Stimulation Électrique (Mapping & Prediction)
 =============================================================
+Compatible avec les deux formats de données :
+    - ANCIEN : time_s, target_time_s, stim_index (toutes les lignes = stim)
+    - NOUVEAU (timeline) : onset_actual_s, onset_planned_s, action, label, ...
+      (les lignes incluent markers/visuels → filtrage sur action)
+
 Panneaux :
     1. Précision temporelle (scheduling_error_ms)
     2. ISI intra-bloc vs cible 500 ms
@@ -34,6 +39,112 @@ CONDITION_COLORS = {
     "mapping": "#9467bd",
 }
 
+# Colonnes canoniques utilisées en interne par le QC
+_CANONICAL = {
+    "time_s":               "time_s",
+    "target_time_s":        "target_time_s",
+    "stim_index":           "stim_index",
+    "scheduling_error_ms":  "scheduling_error_ms",
+    "condition":            "condition",
+    "block_index":          "block_index",
+    "finger":               "finger",
+    "is_omission":          "is_omission",
+}
+
+# Mapping nouveau format → canonique
+_NEW_TO_CANONICAL = {
+    "onset_actual_s":       "time_s",
+    "onset_planned_s":      "target_time_s",
+    "stim_index_in_block":  "stim_index",
+}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# FORMAT DETECTION & NORMALIZATION
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _detect_format(columns: set) -> str:
+    """
+    Détecte si le CSV est au format ancien ou nouveau (timeline).
+
+    Returns:
+        'new' si colonnes timeline détectées
+        'old' si colonnes legacy détectées
+        Raises ValueError sinon
+    """
+    new_markers = {"onset_actual_s", "onset_planned_s", "action"}
+    old_markers = {"time_s", "target_time_s", "stim_index"}
+
+    if new_markers.issubset(columns):
+        return "new"
+    elif old_markers.issubset(columns):
+        return "old"
+    else:
+        missing_new = new_markers - columns
+        missing_old = old_markers - columns
+        raise ValueError(
+            f"Format non reconnu.\n"
+            f"  Colonnes présentes : {sorted(columns)}\n"
+            f"  Manquant (nouveau) : {missing_new}\n"
+            f"  Manquant (ancien)  : {missing_old}"
+        )
+
+
+def _normalize_to_canonical(df: pd.DataFrame, fmt: str) -> pd.DataFrame:
+    """
+    Renomme les colonnes vers le format canonique interne.
+    Pour le nouveau format, filtre uniquement les événements de stimulation.
+    """
+    if fmt == "new":
+        # ── Filtrer uniquement les stim events ──
+        if "action" in df.columns:
+            df = df[
+                df["action"].isin(["stim_deliver", "stim_omit"])
+            ].copy()
+
+        # ── Renommer ──
+        rename_map = {}
+        for new_col, canon_col in _NEW_TO_CANONICAL.items():
+            if new_col in df.columns and canon_col not in df.columns:
+                rename_map[new_col] = canon_col
+
+        if rename_map:
+            df = df.rename(columns=rename_map)
+
+    # ── Vérification des colonnes canoniques requises ──
+    required_canonical = {
+        "condition", "block_index", "finger",
+        "is_omission", "time_s", "target_time_s", "scheduling_error_ms",
+    }
+    # stim_index peut être absent dans certains cas anciens
+    present = set(df.columns)
+    missing = required_canonical - present
+    if missing:
+        raise ValueError(f"Colonnes canoniques manquantes après normalisation : {missing}")
+
+    # ── Assurer que stim_index existe ──
+    if "stim_index" not in df.columns:
+        # Reconstruire à partir de l'ordre dans chaque bloc
+        df = df.sort_values(["block_index", "time_s"]).reset_index(drop=True)
+        df["stim_index"] = df.groupby("block_index").cumcount()
+
+    # ── Conversion types ──
+    for col in ["time_s", "target_time_s", "scheduling_error_ms"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["block_index"] = pd.to_numeric(df["block_index"], errors="coerce")
+    df["stim_index"] = pd.to_numeric(df["stim_index"], errors="coerce")
+
+    # is_omission peut être True/False string ou bool
+    if df["is_omission"].dtype == object:
+        df["is_omission"] = df["is_omission"].map(
+            {"True": True, "False": False, "1": True, "0": False,
+             "true": True, "false": False, True: True, False: False}
+        ).fillna(False)
+    df["is_omission"] = df["is_omission"].astype(bool)
+
+    return df.reset_index(drop=True)
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # LOAD
@@ -43,17 +154,28 @@ def _load_and_validate(csv_path: str) -> pd.DataFrame:
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"Fichier non trouvé : {csv_path}")
 
-    df = pd.read_csv(csv_path)
+    df_raw = pd.read_csv(csv_path)
+    columns = set(df_raw.columns)
 
-    required = {
-        "condition", "block_index", "stim_index", "finger",
-        "is_omission", "time_s", "target_time_s", "scheduling_error_ms",
-    }
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Colonnes manquantes : {missing}")
+    fmt = _detect_format(columns)
 
-    return df
+    # Garder les métadonnées du run pour l'affichage
+    run_type = "unknown"
+    run_number = 0
+    if "run_type" in df_raw.columns:
+        run_type = df_raw["run_type"].iloc[0]
+    if "run_number" in df_raw.columns:
+        run_number = df_raw["run_number"].iloc[0]
+
+    df = _normalize_to_canonical(df_raw, fmt)
+
+    # Réinjecter les métadonnées si perdues au filtrage
+    if "run_type" not in df.columns:
+        df["run_type"] = run_type
+    if "run_number" not in df.columns:
+        df["run_number"] = run_number
+
+    return df, fmt
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -132,7 +254,11 @@ def _run_checks(df: pd.DataFrame, df_blocks: pd.DataFrame) -> list:
         ok_blocks = 0
         total_blocks = 0
         for b_idx in sub["block_index"].unique():
-            seq = sub[sub["block_index"] == b_idx].sort_values("stim_index")["finger"].tolist()
+            seq = (
+                sub[sub["block_index"] == b_idx]
+                .sort_values("stim_index")["finger"]
+                .tolist()
+            )
             total_blocks += 1
             if seq == expected:
                 ok_blocks += 1
@@ -149,7 +275,11 @@ def _run_checks(df: pd.DataFrame, df_blocks: pd.DataFrame) -> list:
         violations = 0
         total_blocks = 0
         for b_idx in sub["block_index"].unique():
-            seq = sub[sub["block_index"] == b_idx].sort_values("stim_index")["finger"].tolist()
+            seq = (
+                sub[sub["block_index"] == b_idx]
+                .sort_values("stim_index")["finger"]
+                .tolist()
+            )
             total_blocks += 1
             for i in range(1, len(seq)):
                 if seq[i] == seq[i - 1]:
@@ -185,14 +315,15 @@ def _run_checks(df: pd.DataFrame, df_blocks: pd.DataFrame) -> list:
         )
 
     # ── 6. Timing ──
-    err = df["scheduling_error_ms"]
-    max_err = err.abs().max()
-    pct_over_2ms = (err.abs() > 2.0).mean() * 100
-    msgs.append(
-        f"{'PASS' if max_err < 5.0 else 'WARN'} | "
-        f"Timing : mean={err.mean():.3f}ms, max={max_err:.3f}ms, "
-        f">2ms={pct_over_2ms:.1f}%"
-    )
+    err = df["scheduling_error_ms"].dropna()
+    if not err.empty:
+        max_err = err.abs().max()
+        pct_over_2ms = (err.abs() > 2.0).mean() * 100
+        msgs.append(
+            f"{'PASS' if max_err < 5.0 else 'WARN'} | "
+            f"Timing : mean={err.mean():.3f}ms, max={max_err:.3f}ms, "
+            f">2ms={pct_over_2ms:.1f}%"
+        )
 
     # ── 7. ISI intra-bloc ──
     isi = df["isi_ms"].dropna()
@@ -204,7 +335,7 @@ def _run_checks(df: pd.DataFrame, df_blocks: pd.DataFrame) -> list:
             f"{isi_ok:.0f}% dans [490-510ms]"
         )
 
-    # ── 8. Condition balance ──
+    # ── 8. Condition balance (prediction only) ──
     pred = df[df["condition"].isin(["FP", "TP", "FR", "TR"])]
     if not pred.empty:
         cond_counts = pred.groupby("condition")["block_index"].nunique()
@@ -216,12 +347,13 @@ def _run_checks(df: pd.DataFrame, df_blocks: pd.DataFrame) -> list:
 
     # ── 9. Durée blocs ──
     spans = df_blocks["duration_stim_span_s"]
-    span_ok = spans.between(9.3, 9.7).all()
-    msgs.append(
-        f"{'PASS' if span_ok else 'WARN'} | "
-        f"Durée blocs (span stim) : μ={spans.mean():.3f}s, "
-        f"range=[{spans.min():.3f}, {spans.max():.3f}]"
-    )
+    if not spans.empty:
+        span_ok = spans.between(9.3, 9.7).all()
+        msgs.append(
+            f"{'PASS' if span_ok else 'WARN'} | "
+            f"Durée blocs (span stim) : μ={spans.mean():.3f}s, "
+            f"range=[{spans.min():.3f}, {spans.max():.3f}]"
+        )
 
     return msgs
 
@@ -238,34 +370,39 @@ def _plot_dashboard(df, df_blocks, csv_path, checks, qc_dir):
         fontsize=15, fontweight="bold",
     )
 
-    conds_present = [c for c in ["FP", "TP", "FR", "TR", "mapping"]
-                     if c in df["condition"].unique()]
+    conds_present = [
+        c for c in ["FP", "TP", "FR", "TR", "mapping"]
+        if c in df["condition"].unique()
+    ]
 
     # ════════════════════════════════════════════════════════════════
     # 1. SCHEDULING ERROR
     # ════════════════════════════════════════════════════════════════
     ax = axes[0, 0]
     err = df["scheduling_error_ms"].dropna()
-    sns.histplot(err, kde=True, ax=ax, color="steelblue", bins=40)
-    ax.axvline(0, color="black", ls="--", lw=1)
-    ax.axvline(err.mean(), color="red", ls="-", lw=1,
-               label=f"μ = {err.mean():.3f} ms")
-    ax.axvspan(-2, 2, alpha=0.1, color="green", label="±2 ms")
-    ax.set_title(
-        f"1. Précision Temporelle\n"
-        f"μ={err.mean():.3f} ms | σ={err.std():.3f} ms | "
-        f"max |err|={err.abs().max():.3f} ms"
-    )
+    if not err.empty:
+        sns.histplot(err, kde=True, ax=ax, color="steelblue", bins=40)
+        ax.axvline(0, color="black", ls="--", lw=1)
+        ax.axvline(err.mean(), color="red", ls="-", lw=1,
+                   label=f"μ = {err.mean():.3f} ms")
+        ax.axvspan(-2, 2, alpha=0.1, color="green", label="±2 ms")
+        ax.set_title(
+            f"1. Précision Temporelle\n"
+            f"μ={err.mean():.3f} ms | σ={err.std():.3f} ms | "
+            f"max |err|={err.abs().max():.3f} ms"
+        )
+    else:
+        ax.text(0.5, 0.5, "Pas de données", transform=ax.transAxes, ha="center")
+        ax.set_title("1. Précision Temporelle")
     ax.set_xlabel("Scheduling Error (ms)")
     ax.legend(fontsize=8)
 
     # ════════════════════════════════════════════════════════════════
-    # 2. ISI INTRA-BLOC (zoomé autour de 500 ms)
+    # 2. ISI INTRA-BLOC
     # ════════════════════════════════════════════════════════════════
     ax = axes[0, 1]
     isi = df["isi_ms"].dropna()
     if not isi.empty:
-        # zoom sur la fenêtre pertinente
         isi_clean = isi[isi.between(400, 600)]
         if not isi_clean.empty:
             sns.histplot(isi_clean, kde=True, ax=ax, color="purple", bins=50)
@@ -280,12 +417,14 @@ def _plot_dashboard(df, df_blocks, csv_path, checks, qc_dir):
                 f"{pct_in:.0f}% dans [400-600]"
             )
         else:
-            ax.text(0.5, 0.5, "ISI hors range", transform=ax.transAxes, ha="center")
+            ax.text(0.5, 0.5, "ISI hors range",
+                    transform=ax.transAxes, ha="center")
             ax.set_title("2. ISI Intra-Bloc")
         ax.set_xlabel("Inter-Stimulus Interval (ms)")
         ax.legend(fontsize=8)
     else:
-        ax.text(0.5, 0.5, "Pas de données ISI", transform=ax.transAxes, ha="center")
+        ax.text(0.5, 0.5, "Pas de données ISI",
+                transform=ax.transAxes, ha="center")
         ax.set_title("2. ISI Intra-Bloc")
 
     # ════════════════════════════════════════════════════════════════
@@ -300,9 +439,12 @@ def _plot_dashboard(df, df_blocks, csv_path, checks, qc_dir):
     finger_cond["finger"] = pd.Categorical(
         finger_cond["finger"], categories=FINGER_ORDER, ordered=True
     )
+    # Palette restreinte aux conditions présentes
+    palette = {c: CONDITION_COLORS[c] for c in conds_present
+               if c in CONDITION_COLORS}
     sns.barplot(
         data=finger_cond, x="finger", y="count",
-        hue="condition", palette=CONDITION_COLORS, ax=ax,
+        hue="condition", palette=palette, ax=ax,
     )
     ax.set_title("3. Distribution Doigts × Condition")
     ax.set_ylabel("Nombre total de stims")
@@ -322,9 +464,11 @@ def _plot_dashboard(df, df_blocks, csv_path, checks, qc_dir):
         omit_data["finger"] = pd.Categorical(
             omit_data["finger"], categories=FINGER_ORDER, ordered=True
         )
+        palette_omit = {c: CONDITION_COLORS[c] for c in omit_data["condition"].unique()
+                        if c in CONDITION_COLORS}
         sns.barplot(
             data=omit_data, x="finger", y="n_omissions",
-            hue="condition", palette=CONDITION_COLORS, ax=ax,
+            hue="condition", palette=palette_omit, ax=ax,
         )
         ax.set_title("4. Omissions par Condition × Doigt")
         ax.set_ylabel("Nombre d'omissions")
@@ -337,26 +481,36 @@ def _plot_dashboard(df, df_blocks, csv_path, checks, qc_dir):
     # 5. BLOCK DURATIONS (stim span)
     # ════════════════════════════════════════════════════════════════
     ax = axes[1, 1]
-    colors_list = [CONDITION_COLORS.get(c, "gray") for c in df_blocks["condition"]]
-    ax.bar(
-        df_blocks["block_index"],
-        df_blocks["duration_stim_span_s"],
-        color=colors_list, edgecolor="black", linewidth=0.5,
-    )
-    ax.axhline(9.5, color="red", ls="--", lw=1.5, label="Cible 9.5 s")
-    ax.set_ylim(
-        max(0, df_blocks["duration_stim_span_s"].min() - 0.5),
-        df_blocks["duration_stim_span_s"].max() + 0.5,
-    )
-    ax.set_title(
-        f"5. Durée Blocs ON (1ère→dernière stim)\n"
-        f"μ={df_blocks['duration_stim_span_s'].mean():.3f} s | "
-        f"cible=9.500 s"
-    )
-    ax.set_xlabel("Bloc #")
-    ax.set_ylabel("Durée (s)")
-    patches = [mpatches.Patch(color=CONDITION_COLORS[c], label=c) for c in conds_present]
-    ax.legend(handles=patches, fontsize=7)
+    if not df_blocks.empty:
+        colors_list = [
+            CONDITION_COLORS.get(c, "gray") for c in df_blocks["condition"]
+        ]
+        ax.bar(
+            df_blocks["block_index"],
+            df_blocks["duration_stim_span_s"],
+            color=colors_list, edgecolor="black", linewidth=0.5,
+        )
+        ax.axhline(9.5, color="red", ls="--", lw=1.5, label="Cible 9.5 s")
+        ax.set_ylim(
+            max(0, df_blocks["duration_stim_span_s"].min() - 0.5),
+            df_blocks["duration_stim_span_s"].max() + 0.5,
+        )
+        ax.set_title(
+            f"5. Durée Blocs ON (1ère→dernière stim)\n"
+            f"μ={df_blocks['duration_stim_span_s'].mean():.3f} s | "
+            f"cible=9.500 s"
+        )
+        ax.set_xlabel("Bloc #")
+        ax.set_ylabel("Durée (s)")
+        patches = [
+            mpatches.Patch(color=CONDITION_COLORS[c], label=c)
+            for c in conds_present
+        ]
+        ax.legend(handles=patches, fontsize=7)
+    else:
+        ax.text(0.5, 0.5, "Pas de données blocs",
+                transform=ax.transAxes, ha="center")
+        ax.set_title("5. Durée Blocs ON")
 
     # ════════════════════════════════════════════════════════════════
     # 6. SCHEDULING ERROR OVER TIME (dérive)
@@ -374,12 +528,16 @@ def _plot_dashboard(df, df_blocks, csv_path, checks, qc_dir):
     ax.axhline(2, color="red", ls=":", lw=0.8, alpha=0.5)
     ax.axhline(-2, color="red", ls=":", lw=0.8, alpha=0.5)
 
-    # rolling mean pour voir la dérive
+    # Rolling mean pour visualiser la dérive
     df_sorted = df.sort_values("time_s")
-    if len(df_sorted) > 20:
-        rolling = df_sorted["scheduling_error_ms"].rolling(20, center=True).mean()
-        ax.plot(df_sorted["time_s"], rolling, color="black", lw=1.5,
-                alpha=0.7, label="Rolling mean (20)")
+    err_sorted = df_sorted["scheduling_error_ms"].dropna()
+    if len(err_sorted) > 20:
+        rolling = err_sorted.rolling(20, center=True).mean()
+        ax.plot(
+            df_sorted.loc[rolling.index, "time_s"],
+            rolling,
+            color="black", lw=1.5, alpha=0.7, label="Rolling mean (20)",
+        )
 
     ax.set_title("6. Dérive Temporelle\nScheduling error au fil du run")
     ax.set_xlabel("Temps (s)")
@@ -415,8 +573,8 @@ def qc_connectelec(csv_path: str):
     print(f"  {os.path.basename(csv_path)}")
     print(f"{'═' * 60}")
 
-    df = _load_and_validate(csv_path)
-    print(f"  ✓ {len(df)} lignes chargées")
+    df, fmt = _load_and_validate(csv_path)
+    print(f"  ✓ {len(df)} stimulations chargées (format: {fmt})")
 
     run_type = df["run_type"].iloc[0] if "run_type" in df.columns else "unknown"
     run_num = df["run_number"].iloc[0] if "run_number" in df.columns else 0
@@ -439,22 +597,30 @@ def qc_connectelec(csv_path: str):
 
     # ── Summary CSV ──
     isi = df["isi_ms"].dropna()
+    err = df["scheduling_error_ms"].dropna()
     summary = {
-        "csv_file": os.path.basename(csv_path),
-        "run_type": run_type,
-        "run_number": run_num,
-        "n_blocks": df["block_index"].nunique(),
-        "n_stims_total": len(df),
-        "n_omissions": int(df["is_omission"].sum()),
-        "sched_error_mean_ms": round(df["scheduling_error_ms"].mean(), 4),
-        "sched_error_std_ms": round(df["scheduling_error_ms"].std(), 4),
-        "sched_error_max_ms": round(df["scheduling_error_ms"].abs().max(), 4),
+        "csv_file":               os.path.basename(csv_path),
+        "data_format":            fmt,
+        "run_type":               run_type,
+        "run_number":             run_num,
+        "n_blocks":               df["block_index"].nunique(),
+        "n_stims_total":          len(df),
+        "n_delivered":            int((~df["is_omission"]).sum()),
+        "n_omissions":            int(df["is_omission"].sum()),
+        "sched_error_mean_ms":    round(err.mean(), 4) if not err.empty else None,
+        "sched_error_std_ms":     round(err.std(), 4) if not err.empty else None,
+        "sched_error_max_abs_ms": round(err.abs().max(), 4) if not err.empty else None,
         "isi_intrablock_mean_ms": round(isi.mean(), 2) if not isi.empty else None,
-        "isi_intrablock_std_ms": round(isi.std(), 2) if not isi.empty else None,
-        "block_span_mean_s": round(df_blocks["duration_stim_span_s"].mean(), 4),
-        "pct_timing_over_2ms": round(
-            (df["scheduling_error_ms"].abs() > 2).mean() * 100, 1
-        ),
+        "isi_intrablock_std_ms":  round(isi.std(), 2) if not isi.empty else None,
+        "block_span_mean_s":      round(
+            df_blocks["duration_stim_span_s"].mean(), 4
+        ) if not df_blocks.empty else None,
+        "pct_timing_over_1ms":    round(
+            (err.abs() > 1).mean() * 100, 1
+        ) if not err.empty else None,
+        "pct_timing_over_2ms":    round(
+            (err.abs() > 2).mean() * 100, 1
+        ) if not err.empty else None,
     }
     summary_path = os.path.join(
         qc_dir, os.path.basename(csv_path).replace(".csv", "_summary.csv")
@@ -462,6 +628,7 @@ def qc_connectelec(csv_path: str):
     pd.DataFrame([summary]).to_csv(summary_path, index=False)
     print(f"  ✓ Summary CSV : {summary_path}")
 
+    # ── Verdict ──
     n_fail = sum(1 for m in checks if m.startswith("FAIL"))
     n_warn = sum(1 for m in checks if m.startswith("WARN"))
     if n_fail == 0 and n_warn == 0:
@@ -473,20 +640,3 @@ def qc_connectelec(csv_path: str):
 
     print(f"{'═' * 60}\n")
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-if __name__ == "__main__":
-    if len(sys.argv) >= 2:
-        qc_connectelec(sys.argv[1])
-    else:
-        pattern = os.path.join("data", "**", "*.csv")
-        files = glob.glob(pattern, recursive=True)
-        files = [f for f in files
-                 if "/qc/" not in f and "\\qc\\" not in f
-                 and "_QC" not in f and "_summary" not in f]
-        if not files:
-            print("Aucun CSV trouvé dans data/")
-            sys.exit(1)
-        latest = max(files, key=os.path.getmtime)
-        print(f"Fichier le plus récent : {latest}")
-        qc_connectelec(latest)
