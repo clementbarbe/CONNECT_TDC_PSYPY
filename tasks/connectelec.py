@@ -1,27 +1,38 @@
-# connectelec.py — version corrigée
+# connectelec.py
 """
-Stimulation Électrique — Somatotopie Digitale & Tâche de Prédiction
-====================================================================
+Stimulation Électrique — File-Driven Pre-Computed Timeline
+===========================================================
 7T laminar fMRI — UN run par lancement.
 
-ARCHITECTURE : PRE-COMPUTED TIMELINE
-─────────────────────────────────────
-1. À l'initialisation, TOUS les événements sont pré-calculés dans une
-   timeline unique, triée par onset.
-2. Après le trigger IRM, le moteur d'exécution parcourt la timeline :
-     • attente de l'onset prévu (spin-wait haute précision pour les stims)
-     • exécution de l'action (flip, port parallèle, ou simple marqueur)
-     • enregistrement du temps réel
-3. Zéro calcul de séquence ou de jitter pendant l'acquisition.
+FORMATS DE DESIGN (TSV avec header) :
+──────────────────────────────────────
+SOMATOTOPIE  → design/somatotopie/somatotopie.tsv
+    colonnes : onset   duration   finger
+    ex :       13.500  2.5        D1
 
-CORRECTION CRITIQUE : les événements visuels (win.flip) sont planifiés
-UN FRAME AVANT les événements de stimulation pour éviter que le flip
-bloquant ne retarde les pulses.
+PREDICTION   → design/prediction/runN/prediction.tsv
+    colonnes : onset  duration  condition  finger  is_stimulated  is_omission
+    ex :       11.700 3.00      FR         D1      1              0
+
+DURÉES HARDCODÉES :
+───────────────────
+Chaque run a une durée totale fixe (incluant un padding post-stim).
+La timeline se termine exactement à cette durée, indépendamment du
+dernier événement de stimulation.
+
+ARCHITECTURE :
+──────────────
+1.  Les timings sont lus depuis les fichiers de design.
+2.  Pour chaque événement stimulé :
+      a. finger_select (pin doigt) à onset − 250 ms
+      b. Train de triggers 64 espacés de burst_interval_ms
+3.  Pour chaque omission : un marqueur est enregistré, aucun trigger.
+4.  La timeline complète est pré-calculée avant le trigger IRM.
 
 Fichiers produits :
-    *_planned.csv       → timeline planifiée (avant exécution)
-    *_incremental.csv   → écriture événement par événement pendant l'exécution
-    *_<timestamp>.csv   → fichier final propre (planned + actual)
+    *_planned.csv       → timeline planifiée
+    *_incremental.csv   → écriture progressive pendant l'exécution
+    *_<timestamp>.csv   → fichier final propre
 """
 
 from __future__ import annotations
@@ -29,7 +40,6 @@ from __future__ import annotations
 import csv
 import gc
 import os
-import random
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -41,22 +51,41 @@ from utils.base_task import BaseTask
 # ═════════════════════════════════════════════════════════════════════════════
 
 FINGER_PIN_MAP: Dict[str, int] = {
-    "D1": 2, "D2": 4, "D3": 8, "D4": 16,
+    "D1": 2, "D2": 4, "D3": 8, "D4": 16, "D5": 32,
 }
 
-FINGERS_4: List[str]              = ["D1", "D2", "D3", "D4"]
-PREDICTABLE_ORDER: List[str]      = ["D1", "D2", "D3", "D4"]
-PREDICTION_CONDITIONS: List[str]  = ["FP", "TP", "FR", "TR"]
-OMISSION_FINGER: str              = "D4"
+STIM_TRIGGER: int = 64
+DEFAULT_BURST_INTERVAL_MS: float = 75.0
+FINGER_SWITCH_LEAD_MS: float = 250.0        # fixe
+TR_S: float = 2.0                            # fixe
 
-# Priorité de tri quand plusieurs événements partagent le même onset
+# ── DURÉES HARDCODÉES (secondes) ──────────────────────────────────────
+#    Modifier ces valeurs pour changer la durée totale de chaque run.
+#    Le run_end marker est placé exactement à cette durée.
+RUN_DURATIONS_S: Dict[str, float] = {
+    "somatotopy":   16*60,      # 5 min
+    "prediction_1": 480.0,      # 6 min
+    "prediction_2": 480.0,      # 6 min
+    "prediction_3": 480.0,      # 6 min
+}
+
 _ACTION_PRIORITY: Dict[str, int] = {
-    "visual_fixation":     0,   # flip d'abord
-    "visual_instruction":  0,
-    "marker":              1,   # puis marqueurs
-    "stim_deliver":        2,   # puis stims (ne devrait plus arriver
-    "stim_omit":           2,   # au même onset qu'un flip)
+    "visual_fixation": 0,
+    "finger_select":   1,
+    "marker":          2,
+    "stim_burst":      3,
+    "stim_omit":       3,
 }
+
+DESIGN_PATHS: Dict[str, str] = {
+    "somatotopy":   os.path.join("design", "somatotopie"),
+    "prediction_1": os.path.join("design", "prediction", "run1"),
+    "prediction_2": os.path.join("design", "prediction", "run2"),
+    "prediction_3": os.path.join("design", "prediction", "run3"),
+}
+
+SOMATOTOPY_TSV_NAME: str = "somatotopie.tsv"
+PREDICTION_TSV_NAME: str = "prediction.tsv"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -64,11 +93,12 @@ _ACTION_PRIORITY: Dict[str, int] = {
 class ConnectElec(BaseTask):
     """
     One run per instantiation.
-    run_type = 'mapping' or 'prediction'
-    run_number = integer assigned from the GUI.
-
-    Toute la séquence est pré-calculée dans self.timeline avant le trigger.
+    Timeline entièrement construite depuis les fichiers de design.
     """
+
+    # ─────────────────────────────────────────────────────────────────────
+    #  INIT
+    # ─────────────────────────────────────────────────────────────────────
 
     def __init__(
         self,
@@ -76,25 +106,9 @@ class ConnectElec(BaseTask):
         nom: str,
         session: str = "01",
         mode: str = "fmri",
-        run_type: str = "mapping",
+        run_type: str = "somatotopy",
         run_number: int = 1,
-        # ── mapping ──
-        n_mapping_blocks: int = 20,
-        mapping_off_jitter: float = 0.0,
-        # ── prediction ──
-        n_reps_per_condition: int = 5,
-        # ── stimulation timing ──
-        stims_per_finger: int = 5,
-        stim_interval_ms: float = 500.0,
-        # ── block timing ──
-        block_on_duration: float = 10.0,
-        block_off_duration: float = 10.0,
-        instruction_duration: float = 5.0,
-        instruction_jitter: float = 1.0,
-        # ── pauses ──
-        initial_baseline: float = 10.0,
-        # ── misc ──
-        prediction_conditions: Optional[List[str]] = None,
+        burst_interval_ms: float = DEFAULT_BURST_INTERVAL_MS,
         enregistrer: bool = True,
         eyetracker_actif: bool = False,
         parport_actif: bool = True,
@@ -116,62 +130,51 @@ class ConnectElec(BaseTask):
         # ── identifiers ──────────────────────────────────────────────────
         self.mode: str       = mode.lower()
         self.run_type: str   = run_type.lower()
+        if self.run_type == "mapping":
+            self.run_type = "somatotopy"
         self.run_number: int = run_number
 
-        # ── mapping ───────────────────────────────────────────────────────
-        self.n_mapping_blocks: int     = n_mapping_blocks
-        self.mapping_off_jitter: float = mapping_off_jitter
+        # ── burst timing ─────────────────────────────────────────────────
+        self.burst_interval_ms: float    = burst_interval_ms
+        self.burst_interval_s: float     = burst_interval_ms / 1000.0
+        self.finger_switch_lead_s: float = FINGER_SWITCH_LEAD_MS / 1000.0
 
-        # ── prediction ────────────────────────────────────────────────────
-        self.n_reps_per_condition: int = n_reps_per_condition
-        self.n_blocks_per_run: int = (
-            len(PREDICTION_CONDITIONS) * n_reps_per_condition
+        # ── run duration (hardcoded) ─────────────────────────────────────
+        dur_key = (
+            "somatotopy" if self.run_type == "somatotopy"
+            else f"prediction_{self.run_number}"
         )
-        self.prediction_conditions: List[str] = (
-            prediction_conditions or list(PREDICTION_CONDITIONS)
-        )
+        self.run_duration_s: float = RUN_DURATIONS_S.get(dur_key, 360.0)
 
-        # ── stim timing ──────────────────────────────────────────────────
-        self.stims_per_finger: int  = stims_per_finger
-        self.stim_interval_s: float = stim_interval_ms / 1000.0
-        self.n_stims_per_block: int = len(FINGERS_4) * stims_per_finger
-
-        # ── block timing ─────────────────────────────────────────────────
-        self.block_on_duration: float    = block_on_duration
-        self.block_off_duration: float   = block_off_duration
-        self.instruction_duration: float = instruction_duration
-        self.instruction_jitter: float   = instruction_jitter
-        self.initial_baseline: float     = initial_baseline
-
-        # ── hardware ──────────────────────────────────────────────────────
+        # ── hardware map ─────────────────────────────────────────────────
         self.finger_pin_map: Dict[str, int] = dict(FINGER_PIN_MAP)
 
         # ── runtime state ─────────────────────────────────────────────────
         self.global_records: List[Dict[str, Any]] = []
-
-        # ═══ PRE-COMPUTED TIMELINE ═══
         self.timeline: List[Dict[str, Any]] = []
 
         # ── init chain ────────────────────────────────────────────────────
         self._detect_display_scaling()
         self._measure_frame_rate()
         self._setup_key_mapping()
-        self._setup_visual_stimuli()
         self._init_incremental_file(
             suffix=f"_{self.run_type}_run{self.run_number:02d}"
         )
 
-        # ── BUILD THE ENTIRE TIMELINE ────────────────────────────────────
+        # ── LOAD FILES & BUILD TIMELINE ──────────────────────────────────
+        self._design_dir: str = self._resolve_design_dir()
+        self._stim_events: List[Dict[str, Any]] = self._load_stim_events()
         self._build_full_timeline()
         self._save_planned_timeline()
 
+        n_vol = int(self.run_duration_s / TR_S)
         self.logger.ok(
             f"ConnectElec ready | {self.run_type} "
             f"run {self.run_number:02d} | "
-            f"{self.frame_rate:.1f} Hz | "
-            f"frame = {self.frame_duration_s * 1000:.1f} ms | "
-            f"{len(self.timeline)} events pre-computed | "
-            f"~{self.timeline[-1]['onset_s']:.1f} s"
+            f"{len(self.timeline)} events | "
+            f"run duration = {self.run_duration_s:.0f} s "
+            f"({self.run_duration_s / 60:.1f} min) | "
+            f"{n_vol} volumes (TR={TR_S}s)"
         )
 
     # =====================================================================
@@ -185,12 +188,11 @@ class ConnectElec(BaseTask):
         measured = self.win.getActualFrameRate(
             nIdentical=10, nMaxFrames=100, threshold=1
         )
-        self.frame_rate = measured if measured else 60.0
-        self.frame_duration_s  = 1.0 / self.frame_rate
-        self.frame_tolerance_s = 0.75 / self.frame_rate
+        self.frame_rate: float = measured if measured else 60.0
+        self.frame_duration_s: float = 1.0 / self.frame_rate
         self.logger.log(
-            f"Frame rate: {self.frame_rate:.1f} Hz → "
-            f"{self.frame_duration_s * 1000:.2f} ms/frame"
+            f"Frame rate: {self.frame_rate:.1f} Hz "
+            f"({self.frame_duration_s * 1000:.2f} ms/frame)"
         )
 
     def _setup_key_mapping(self) -> None:
@@ -202,410 +204,349 @@ class ConnectElec(BaseTask):
             self.key_continue = "space"
 
     # =====================================================================
-    #  VISUAL STIMULI
+    #  DESIGN FILE LOADING
     # =====================================================================
 
-    def _setup_visual_stimuli(self) -> None:
-        self.cue_stim = visual.TextStim(
-            self.win, text="", height=0.06, color="white",
-            pos=(0.0, 0.25), wrapWidth=1.6, font="Arial", bold=True,
-        )
-        self.condition_cues: Dict[str, str] = {
-            "FP": (
-                "Faites attention à la stimulation de chaque doigt et "
-                "prédisez\nquand l'index sera stimulé selon le rythme "
-                "temporel."
-            ),
-            "TP": (
-                "Faites attention à la stimulation de chaque doigt et "
-                "prédisez\nquand l'index sera stimulé, même si aucune "
-                "stimulation n'est délivrée."
-            ),
-            "FR": (
-                "Faites attention à la stimulation de chaque doigt,\n"
-                "mais n'essayez pas de prédire un motif rythmique ou "
-                "temporel."
-            ),
-            "TR": (
-                "Faites attention à la stimulation de chaque doigt,\n"
-                "mais n'essayez pas de prédire un motif rythmique ou "
-                "temporel."
-            ),
-        }
-        self._setup_condition_images()
+    def _resolve_design_dir(self) -> str:
+        if self.run_type == "somatotopy":
+            key = "somatotopy"
+        else:
+            key = f"prediction_{self.run_number}"
 
-    def _setup_condition_images(self) -> None:
-        from pathlib import Path
-        self.condition_image_paths = {
-            "FP": "image/fp.png", "TP": "image/fp.png",
-            "FR": "image/fr.png", "TR": "image/fr.png",
-        }
-        self.condition_images_stim = {}
-        for cond, path in self.condition_image_paths.items():
-            if Path(path).exists():
-                self.condition_images_stim[cond] = visual.ImageStim(
-                    self.win, image=path,
-                    size=(0.5 * 0.7, 0.7 * 0.7), pos=(0, -0.5),
+        rel = DESIGN_PATHS.get(key)
+        if rel is None:
+            raise FileNotFoundError(
+                f"Configuration de run inconnue : {key}"
+            )
+
+        full = os.path.join(self.root_dir, rel)
+        if not os.path.isdir(full):
+            raise FileNotFoundError(
+                f"Dossier de design introuvable : {full}"
+            )
+
+        self.logger.log(f"Design dir : {full}")
+        return full
+
+    # ── Dispatcher ───────────────────────────────────────────────────────
+
+    def _load_stim_events(self) -> List[Dict[str, Any]]:
+        if self.run_type == "somatotopy":
+            events = self._load_somatotopy_tsv()
+        else:
+            events = self._load_prediction_tsv()
+
+        if not events:
+            raise ValueError(
+                f"Aucun événement de stimulation dans {self._design_dir}"
+            )
+
+        events.sort(key=lambda e: e["onset_s"])
+
+        # ── Validation : aucun événement ne dépasse la durée du run ──
+        last_end = max(
+            e["onset_s"] + e["duration_s"] for e in events
+        )
+        if last_end > self.run_duration_s:
+            self.logger.warn(
+                f"Dernier événement se termine à {last_end:.1f} s "
+                f"mais le run dure {self.run_duration_s:.1f} s — "
+                f"les événements tardifs seront quand même exécutés."
+            )
+
+        return events
+
+    # ── Somatotopie : somatotopie.tsv (3 colonnes TSV) ──────────────────
+
+    def _load_somatotopy_tsv(self) -> List[Dict[str, Any]]:
+        """
+        Format TSV avec header :
+            onset   duration   finger
+            13.500  2.5        D1
+        """
+        fpath = os.path.join(self._design_dir, SOMATOTOPY_TSV_NAME)
+        if not os.path.exists(fpath):
+            raise FileNotFoundError(
+                f"Fichier {SOMATOTOPY_TSV_NAME} introuvable : {fpath}"
+            )
+
+        events: List[Dict[str, Any]] = []
+        fingers_seen: set = set()
+
+        with open(fpath, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+
+            if reader.fieldnames is None:
+                raise ValueError(f"Fichier vide : {fpath}")
+
+            required = {"onset", "duration", "finger"}
+            actual = set(reader.fieldnames)
+            missing = required - actual
+            if missing:
+                raise ValueError(
+                    f"Colonnes manquantes dans {fpath} : {missing}\n"
+                    f"Colonnes trouvées : {actual}"
                 )
 
-    # =====================================================================
-    #  SEQUENCE GENERATION (appelé au build, jamais pendant le run)
-    # =====================================================================
+            for row_num, row in enumerate(reader, start=2):
+                try:
+                    onset_s    = float(row["onset"])
+                    duration_s = float(row["duration"])
+                    finger     = row["finger"].strip()
+                except (ValueError, KeyError) as exc:
+                    self.logger.warn(
+                        f"{SOMATOTOPY_TSV_NAME}:{row_num} — "
+                        f"parse error : {exc}"
+                    )
+                    continue
 
-    @staticmethod
-    def _pseudo_random_no_repeat(
-        items: List[str], reps: int, max_attempts: int = 500
-    ) -> List[str]:
-        pool = [it for it in items for _ in range(reps)]
-        for _ in range(max_attempts):
-            seq: List[str] = []
-            bag = pool[:]
-            random.shuffle(bag)
-            ok = True
-            while bag:
-                candidates = (
-                    [x for x in bag if x != seq[-1]] if seq else bag[:]
-                )
-                if not candidates:
-                    ok = False
-                    break
-                chosen = random.choice(candidates)
-                seq.append(chosen)
-                bag.remove(chosen)
-            if ok and len(seq) == len(pool):
-                return seq
-        random.shuffle(pool)
-        return pool
+                if finger not in FINGER_PIN_MAP:
+                    self.logger.warn(
+                        f"{SOMATOTOPY_TSV_NAME}:{row_num} — "
+                        f"doigt inconnu '{finger}', ignoré"
+                    )
+                    continue
 
-    def _build_predictable_seq(self) -> List[str]:
-        total = len(FINGERS_4) * self.stims_per_finger
-        return [
-            PREDICTABLE_ORDER[i % len(PREDICTABLE_ORDER)]
-            for i in range(total)
-        ]
+                fingers_seen.add(finger)
+                events.append({
+                    "finger":        finger,
+                    "onset_s":       onset_s,
+                    "duration_s":    duration_s,
+                    "condition":     "somatotopy",
+                    "is_stimulated": True,
+                    "is_omission":   False,
+                })
 
-    def _build_random_seq(self) -> List[str]:
-        return self._pseudo_random_no_repeat(FINGERS_4, self.stims_per_finger)
-
-    def _build_block_stim_list(
-        self, condition: str
-    ) -> List[Dict[str, Any]]:
-        if condition in ("mapping", "FR"):
-            raw = self._build_random_seq()
-            return [{"finger": f, "is_omission": False} for f in raw]
-        if condition == "FP":
-            raw = self._build_predictable_seq()
-            return [{"finger": f, "is_omission": False} for f in raw]
-        if condition == "TP":
-            raw = self._build_predictable_seq()
-            return [
-                {"finger": f, "is_omission": f == OMISSION_FINGER}
-                for f in raw
-            ]
-        if condition == "TR":
-            raw = self._build_random_seq()
-            return [
-                {"finger": f, "is_omission": f == OMISSION_FINGER}
-                for f in raw
-            ]
-        self.logger.err(f"Unknown condition '{condition}'")
-        return []
-
-    def _build_run_block_order(self) -> List[str]:
-        return self._pseudo_random_no_repeat(
-            self.prediction_conditions, self.n_reps_per_condition
+        self.logger.log(
+            f"Somatotopy : {len(events)} événements "
+            f"({', '.join(sorted(fingers_seen))})"
         )
+        return events
 
-    # ═════════════════════════════════════════════════════════════════════
+    # ── Prediction : prediction.tsv (6 colonnes TSV) ────────────────────
+
+    def _load_prediction_tsv(self) -> List[Dict[str, Any]]:
+        """
+        Format TSV avec header :
+            onset  duration  condition  finger  is_stimulated  is_omission
+        """
+        fpath = os.path.join(self._design_dir, PREDICTION_TSV_NAME)
+        if not os.path.exists(fpath):
+            raise FileNotFoundError(
+                f"Fichier {PREDICTION_TSV_NAME} introuvable : {fpath}"
+            )
+
+        events: List[Dict[str, Any]] = []
+        conditions_seen: set = set()
+        fingers_seen: set = set()
+
+        with open(fpath, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+
+            if reader.fieldnames is None:
+                raise ValueError(f"Fichier vide : {fpath}")
+
+            required = {
+                "onset", "duration", "condition",
+                "finger", "is_stimulated", "is_omission",
+            }
+            actual = set(reader.fieldnames)
+            missing = required - actual
+            if missing:
+                raise ValueError(
+                    f"Colonnes manquantes dans {fpath} : {missing}\n"
+                    f"Colonnes trouvées : {actual}"
+                )
+
+            for row_num, row in enumerate(reader, start=2):
+                try:
+                    onset_s       = float(row["onset"])
+                    duration_s    = float(row["duration"])
+                    condition     = row["condition"].strip()
+                    finger        = row["finger"].strip()
+                    is_stimulated = int(row["is_stimulated"]) == 1
+                    is_omission   = int(row["is_omission"]) == 1
+                except (ValueError, KeyError) as exc:
+                    self.logger.warn(
+                        f"{PREDICTION_TSV_NAME}:{row_num} — "
+                        f"parse error : {exc}"
+                    )
+                    continue
+
+                if finger not in FINGER_PIN_MAP:
+                    self.logger.warn(
+                        f"{PREDICTION_TSV_NAME}:{row_num} — "
+                        f"doigt inconnu '{finger}', ignoré"
+                    )
+                    continue
+
+                conditions_seen.add(condition)
+                fingers_seen.add(finger)
+
+                events.append({
+                    "finger":        finger,
+                    "onset_s":       onset_s,
+                    "duration_s":    duration_s,
+                    "condition":     condition,
+                    "is_stimulated": is_stimulated,
+                    "is_omission":   is_omission,
+                })
+
+        n_stim = sum(1 for e in events if e["is_stimulated"])
+        n_omit = sum(1 for e in events if e["is_omission"])
+        self.logger.log(
+            f"Prediction : {len(events)} événements "
+            f"({n_stim} stimulés, {n_omit} omissions) | "
+            f"conditions : {sorted(conditions_seen)} | "
+            f"doigts : {sorted(fingers_seen)}"
+        )
+        return events
+
+    # =====================================================================
     #  TIMELINE CONSTRUCTION
-    # ═════════════════════════════════════════════════════════════════════
+    # =====================================================================
 
-    def _add_event(
-        self, onset_s: float, action: str, **kwargs: Any
-    ) -> None:
-        """Ajoute un événement à la timeline pré-calculée."""
-        event: Dict[str, Any] = {
+    def _add_event(self, onset_s: float, action: str, **kw: Any) -> None:
+        evt: Dict[str, Any] = {
             "onset_s":   round(onset_s, 6),
             "action":    action,
             "_priority": _ACTION_PRIORITY.get(action, 9),
         }
-        event.update(kwargs)
-        self.timeline.append(event)
+        evt.update(kw)
+        self.timeline.append(evt)
 
     def _build_full_timeline(self) -> None:
         """
-        Construit la timeline complète AVANT le trigger IRM.
+        Construit la timeline complète.
 
-        RÈGLE CRITIQUE : tout événement visual (win.flip) est planifié
-        au minimum 2 frames avant le prochain événement de stimulation,
-        pour que le flip bloquant soit terminé bien avant le pulse.
+        Pour chaque événement STIMULÉ :
+          1. finger_select   à onset − 250 ms
+          2. stim_burst × N  à onset + i × burst_interval
+
+        Pour chaque OMISSION :
+          1. stim_omit (marqueur seul)
+
+        La timeline se termine à self.run_duration_s (hardcodé),
+        ce qui assure un padding post-stim constant.
         """
         self.timeline.clear()
 
-        if self.run_type == "mapping":
-            self._build_mapping_timeline()
-        else:
-            self._build_prediction_timeline()
+        # ── Run start + fixation ──
+        self._add_event(0.0, "marker", label="run_start",
+                        run_type=self.run_type,
+                        run_number=self.run_number)
+        self._add_event(0.0, "visual_fixation", label="fixation_start")
 
-        # Tri stable : onset, puis priorité
+        # ── Événements de stimulation ──
+        for ei, stim in enumerate(self._stim_events):
+            onset      = stim["onset_s"]
+            duration   = stim["duration_s"]
+            finger     = stim["finger"]
+            condition  = stim.get("condition", "")
+            is_stim    = stim["is_stimulated"]
+            is_omit    = stim["is_omission"]
+            pin        = self.finger_pin_map[finger]
+
+            if is_stim and duration > 0:
+                # ── Sélection du doigt ──
+                sel_t = max(0.0, onset - self.finger_switch_lead_s)
+                self._add_event(
+                    sel_t, "finger_select",
+                    label="finger_select",
+                    finger=finger,
+                    pin_code=pin,
+                    condition=condition,
+                    stim_event_idx=ei,
+                )
+
+                # ── Train de bursts ──
+                n_bursts = max(
+                    1, int(duration / self.burst_interval_s + 1e-9) + 1
+                )
+                for bi in range(n_bursts):
+                    burst_t = onset + bi * self.burst_interval_s
+                    if bi > 0 and burst_t > onset + duration + 1e-6:
+                        break
+                    self._add_event(
+                        burst_t, "stim_burst",
+                        label="stim_burst",
+                        finger=finger,
+                        pin_code=STIM_TRIGGER,
+                        condition=condition,
+                        stim_event_idx=ei,
+                        burst_index=bi,
+                        n_bursts=n_bursts,
+                        is_omission=False,
+                    )
+
+            elif is_omit:
+                # ── Omission ──
+                self._add_event(
+                    onset, "stim_omit",
+                    label="stim_omit",
+                    finger=finger,
+                    pin_code=0,
+                    condition=condition,
+                    stim_event_idx=ei,
+                    is_omission=True,
+                    duration_s=0.0,
+                )
+
+            else:
+                self.logger.warn(
+                    f"Événement {ei} ignoré (ni stimulé ni omission)"
+                )
+
+        # ── Run end : durée hardcodée ──
+        self._add_event(
+            self.run_duration_s, "visual_fixation",
+            label="final_fixation",
+        )
+        self._add_event(
+            self.run_duration_s, "marker",
+            label="run_end",
+            run_duration_s=self.run_duration_s,
+        )
+
+        # ── Tri stable : onset → priorité ──
         self.timeline.sort(key=lambda e: (e["onset_s"], e["_priority"]))
 
-        # Numérotation séquentielle
         for i, evt in enumerate(self.timeline):
             evt["event_index"] = i
 
-        # Validation : aucun flip ne doit être au même onset qu'un stim
-        self._validate_no_flip_stim_collision()
+        # ── Résumé ──
+        n_sel   = sum(1 for e in self.timeline
+                      if e["action"] == "finger_select")
+        n_burst = sum(1 for e in self.timeline
+                      if e["action"] == "stim_burst")
+        n_omit  = sum(1 for e in self.timeline
+                      if e["action"] == "stim_omit")
 
-        n_stim = sum(
-            1 for e in self.timeline
-            if e["action"] in ("stim_deliver", "stim_omit")
+        last_stim = max(
+            (e["onset_s"] + e.get("duration_s", 0)
+             for e in self._stim_events),
+            default=0.0,
         )
-        n_vis = sum(
-            1 for e in self.timeline
-            if e["action"].startswith("visual_")
-        )
-        total_dur = self.timeline[-1]["onset_s"] if self.timeline else 0
+        padding = self.run_duration_s - last_stim
 
         self.logger.log(
-            f"Timeline built: {len(self.timeline)} events "
-            f"({n_stim} stim, {n_vis} visual, "
-            f"{len(self.timeline) - n_stim - n_vis} markers) | "
-            f"~{total_dur:.1f} s ({total_dur / 60:.1f} min)"
+            f"Timeline : {len(self.timeline)} events "
+            f"({n_sel} select, {n_burst} burst, {n_omit} omit) | "
+            f"last stim ends at {last_stim:.1f} s | "
+            f"padding = {padding:.1f} s | "
+            f"run_end = {self.run_duration_s:.1f} s"
         )
-
-    def _validate_no_flip_stim_collision(self) -> None:
-        """
-        Vérifie qu'aucun événement visuel (flip bloquant) n'est planifié
-        au même onset qu'une stimulation. Si c'est le cas, c'est un bug
-        de construction de la timeline.
-        """
-        visual_onsets = set()
-        stim_onsets = set()
-
-        for evt in self.timeline:
-            if evt["action"].startswith("visual_"):
-                visual_onsets.add(evt["onset_s"])
-            elif evt["action"] in ("stim_deliver", "stim_omit"):
-                stim_onsets.add(evt["onset_s"])
-
-        collisions = visual_onsets & stim_onsets
-        if collisions:
-            self.logger.err(
-                f"TIMELINE BUG: {len(collisions)} flip/stim collisions "
-                f"detected! First at t={min(collisions):.3f} s. "
-                f"Flips will delay stim pulses."
-            )
-        else:
-            self.logger.ok(
-                "Timeline validated: no flip/stim collisions."
-            )
-
-    # ── Mapping ──────────────────────────────────────────────────────────
-
-    def _build_mapping_timeline(self) -> None:
-        t = 0.0
-        n = self.n_mapping_blocks
-
-        # Marge de sécurité : 2 frames avant la première stim
-        flip_lead_s = 2.0 * self.frame_duration_s
-
-        self._add_event(t, "marker", label="run_start",
-                        run_type="mapping", n_blocks=n)
-
-        # ── Baseline : fixation ──
-        self._add_event(t, "visual_fixation", label="baseline_start")
-        t += self.initial_baseline
-
-        for b in range(1, n + 1):
-            stim_seq = self._build_block_stim_list("mapping")
-            block_on_start = t
-
-            # ── ON : fixation AVANT les stims ──
-            # Le flip est planifié 2 frames AVANT le premier pulse
-            self._add_event(
-                block_on_start - flip_lead_s,
-                "visual_fixation",
-                label="block_on_start",
-                block_index=b,
-                condition="mapping",
-                n_stims=len(stim_seq),
-            )
-
-            self._add_event(
-                block_on_start,
-                "marker",
-                label="block_on_stim_start",
-                block_index=b,
-                condition="mapping",
-            )
-
-            # ── Train de stimulations ──
-            for si, info in enumerate(stim_seq):
-                stim_t = block_on_start + si * self.stim_interval_s
-                self._add_event(
-                    stim_t,
-                    "stim_omit" if info["is_omission"] else "stim_deliver",
-                    finger=info["finger"],
-                    pin_code=(
-                        0 if info["is_omission"]
-                        else self.finger_pin_map[info["finger"]]
-                    ),
-                    is_omission=info["is_omission"],
-                    condition="mapping",
-                    block_index=b,
-                    stim_index_in_block=si,
-                )
-
-            t = block_on_start + self.block_on_duration
-
-            self._add_event(
-                t, "marker", label="block_on_end",
-                block_index=b, condition="mapping",
-            )
-
-            # ── OFF : fixation ──
-            off_jitter = (
-                random.uniform(
-                    -self.mapping_off_jitter,
-                    self.mapping_off_jitter,
-                )
-                if self.mapping_off_jitter > 0 else 0.0
-            )
-            off_dur = max(1.0, self.block_off_duration + off_jitter)
-
-            # Le flip pour l'OFF n'a pas besoin de lead car
-            # aucune stim ne suit immédiatement dans le même bloc
-            self._add_event(
-                t, "visual_fixation",
-                label="block_off_start",
-                block_index=b,
-                off_duration_s=round(off_dur, 3),
-            )
-            t += off_dur
-
-            self._add_event(
-                t, "marker", label="block_off_end",
-                block_index=b,
-            )
-
-        self._add_event(t, "marker", label="run_end")
-
-    # ── Prediction ───────────────────────────────────────────────────────
-
-    def _build_prediction_timeline(self) -> None:
-        t = 0.0
-        block_order = self._build_run_block_order()
-        n = len(block_order)
-
-        flip_lead_s = 2.0 * self.frame_duration_s
-
-        self._add_event(
-            t, "marker", label="run_start",
-            run_type="prediction", n_blocks=n,
-            block_order=str(block_order),
-        )
-
-        # ── Baseline ──
-        self._add_event(t, "visual_fixation", label="baseline_start")
-        t += self.initial_baseline
-
-        for b_idx, cond in enumerate(block_order, start=1):
-
-            # ── Instruction (durée jittée, pré-calculée) ──
-            jitter = random.uniform(
-                -self.instruction_jitter, self.instruction_jitter
-            )
-            instr_dur = max(2.0, self.instruction_duration + jitter)
-
-            self._add_event(
-                t, "visual_instruction",
-                label="instruction_start",
-                block_index=b_idx, condition=cond,
-                instruction_text=self.condition_cues.get(cond, cond),
-                instruction_duration_s=round(instr_dur, 3),
-            )
-            t += instr_dur
-
-            self._add_event(
-                t, "marker",
-                label="instruction_end",
-                block_index=b_idx, condition=cond,
-            )
-
-            # ── ON : fixation 2 frames AVANT le premier pulse ──
-            block_on_start = t
-
-            self._add_event(
-                block_on_start - flip_lead_s,
-                "visual_fixation",
-                label="block_on_start",
-                block_index=b_idx,
-                condition=cond,
-                n_stims=len(self._build_block_stim_list(cond)),
-            )
-
-            # Note : on re-build stim_seq ici car _build_block_stim_list
-            # est pseudo-random ; on veut la séquence qui sera réellement
-            # utilisée, pas une autre.
-            stim_seq = self._build_block_stim_list(cond)
-
-            self._add_event(
-                block_on_start, "marker",
-                label="block_on_stim_start",
-                block_index=b_idx, condition=cond,
-            )
-
-            for si, info in enumerate(stim_seq):
-                stim_t = block_on_start + si * self.stim_interval_s
-                self._add_event(
-                    stim_t,
-                    "stim_omit" if info["is_omission"] else "stim_deliver",
-                    finger=info["finger"],
-                    pin_code=(
-                        0 if info["is_omission"]
-                        else self.finger_pin_map[info["finger"]]
-                    ),
-                    is_omission=info["is_omission"],
-                    condition=cond,
-                    block_index=b_idx,
-                    stim_index_in_block=si,
-                )
-
-            t = block_on_start + self.block_on_duration
-
-            self._add_event(
-                t, "marker", label="block_on_end",
-                block_index=b_idx, condition=cond,
-            )
-
-            # ── OFF ──
-            self._add_event(
-                t, "visual_fixation",
-                label="block_off_start",
-                block_index=b_idx, condition=cond,
-                off_duration_s=round(self.block_off_duration, 3),
-            )
-            t += self.block_off_duration
-
-            self._add_event(
-                t, "marker", label="block_off_end",
-                block_index=b_idx, condition=cond,
-            )
-
-        self._add_event(t, "marker", label="run_end")
 
     # ── Sauvegarde planned ───────────────────────────────────────────────
 
     def _save_planned_timeline(self) -> None:
         if not self.enregistrer or not self.timeline:
             return
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        safe_name = self.task_name.replace(' ', '')
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         fname = (
-            f"{self.nom}_{safe_name}"
+            f"{self.nom}_{self.task_name}"
             f"_{self.run_type}_run{self.run_number:02d}"
-            f"_{timestamp}_planned.csv"
+            f"_{ts}_planned.csv"
         )
         path = os.path.join(self.data_dir, fname)
         try:
@@ -613,54 +554,38 @@ class ConnectElec(BaseTask):
                 set().union(*(e.keys() for e in self.timeline))
                 - {"_priority"}
             )
-            with open(path, 'w', newline='', encoding='utf-8') as f:
+            with open(path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(
-                    f, fieldnames=all_keys, extrasaction='ignore',
+                    f, fieldnames=all_keys, extrasaction="ignore"
                 )
                 writer.writeheader()
                 for evt in self.timeline:
                     writer.writerow(
                         {k: v for k, v in evt.items() if k != "_priority"}
                     )
-            self.logger.ok(f"Planned timeline saved: {path}")
-        except Exception as e:
-            self.logger.err(f"Failed to save planned timeline: {e}")
+            self.logger.ok(f"Planned timeline : {path}")
+        except Exception as exc:
+            self.logger.err(f"Sauvegarde planned échouée : {exc}")
 
-    # ═════════════════════════════════════════════════════════════════════
-    #  TIMELINE EXECUTION — Moteur temps-réel minimal
-    # ═════════════════════════════════════════════════════════════════════
+    # =====================================================================
+    #  EXECUTION ENGINE
+    # =====================================================================
 
     def _wait_until(
         self, target_s: float, high_precision: bool = False
     ) -> None:
-        """
-        Attend jusqu'à target_s sur task_clock.
-
-        high_precision=True (stims) :
-            Sleep pour le gros, puis spin-wait pur les 2 dernières ms.
-            Précision sub-milliseconde, CPU burst très court.
-
-        high_precision=False (visuels, marqueurs) :
-            core.wait standard (sleep), suffisant.
-        """
         remaining = target_s - self.task_clock.getTime()
         if remaining <= 0:
             return
-
         if high_precision:
-            # Sleep standard pour le gros de l'attente
             if remaining > 0.003:
                 core.wait(remaining - 0.002, hogCPUperiod=0.0)
-            # Spin-wait pour les dernières ~2 ms
             while self.task_clock.getTime() < target_s:
                 pass
         else:
             core.wait(remaining, hogCPUperiod=0.0)
 
     def _dispatch_event(self, event: Dict[str, Any]) -> float:
-        """
-        Exécute l'action d'un événement. Retourne le temps réel.
-        """
         action = event["action"]
 
         if action == "visual_fixation":
@@ -668,33 +593,25 @@ class ConnectElec(BaseTask):
             self.win.flip()
             return self.task_clock.getTime()
 
-        if action == "visual_instruction":
-            self.cue_stim.text = event.get("instruction_text", "")
-            self.cue_stim.draw()
-            img = self.condition_images_stim.get(event.get("condition"))
-            if img:
-                img.draw()
-            self.fixation.draw()
-            self.win.flip()
-            return self.task_clock.getTime()
-
-        if action == "stim_deliver":
+        if action == "finger_select":
+            t = self.task_clock.getTime()
             self.ParPort.send_trigger(event["pin_code"])
-            return self.task_clock.getTime()
+            return t
+
+        if action == "stim_burst":
+            t = self.task_clock.getTime()
+            self.ParPort.send_trigger(STIM_TRIGGER)
+            return t
 
         if action == "stim_omit":
             return self.task_clock.getTime()
 
-        if action == "marker":
-            return self.task_clock.getTime()
-
         return self.task_clock.getTime()
 
-    def _build_execution_record(
-        self, event: Dict[str, Any], actual_time_s: float
+    def _build_record(
+        self, event: Dict[str, Any], actual_t: float
     ) -> Dict[str, Any]:
-        """Construit l'enregistrement pour UN événement exécuté."""
-        error_ms = (actual_time_s - event["onset_s"]) * 1000.0
+        err_ms = (actual_t - event["onset_s"]) * 1000.0
         return {
             "participant":         self.nom,
             "session":             self.session,
@@ -704,112 +621,103 @@ class ConnectElec(BaseTask):
             "action":              event["action"],
             "label":               event.get("label", ""),
             "onset_planned_s":     event["onset_s"],
-            "onset_actual_s":      round(actual_time_s, 6),
-            "scheduling_error_ms": round(error_ms, 3),
-            "block_index":         event.get("block_index", ""),
+            "onset_actual_s":      round(actual_t, 6),
+            "scheduling_error_ms": round(err_ms, 3),
             "condition":           event.get("condition", ""),
-            "n_stims":             event.get("n_stims", ""),
-            "stim_index_in_block": event.get("stim_index_in_block", ""),
             "finger":              event.get("finger", ""),
             "pin_code":            event.get("pin_code", ""),
             "is_omission":         event.get("is_omission", ""),
+            "stim_event_idx":      event.get("stim_event_idx", ""),
+            "burst_index":         event.get("burst_index", ""),
+            "n_bursts":            event.get("n_bursts", ""),
         }
 
     def _execute_timeline(self) -> None:
-        """
-        Boucle principale : parcourt la timeline pré-calculée.
-        Seule boucle active pendant l'acquisition IRM.
-        """
         n_events = len(self.timeline)
-        self.logger.log(f"Executing timeline: {n_events} events …")
+        self.logger.log(f"Exécution : {n_events} événements …")
 
-        # ══ GC désactivé pour tout le run ══
         gc.disable()
 
         try:
             for i, event in enumerate(self.timeline):
 
-                # ── Quit check sur événements non-critiques ──
-                is_stim = event["action"] in ("stim_deliver", "stim_omit")
-                if not is_stim:
+                is_burst = event["action"] == "stim_burst"
+
+                if not is_burst:
                     self.should_quit()
-                elif event.get("stim_index_in_block", 0) == 0:
-                    # Quit check à S0 de chaque bloc (avant le spin-wait)
+                elif event.get("burst_index", 0) == 0:
                     self.should_quit()
 
-                # ── Attente de l'onset ──
                 self._wait_until(
-                    event["onset_s"], high_precision=is_stim
+                    event["onset_s"],
+                    high_precision=(
+                        is_burst or event["action"] == "finger_select"
+                    ),
                 )
 
-                # ── Exécution ──
                 actual_t = self._dispatch_event(event)
 
-                # ── Enregistrement ──
-                record = self._build_execution_record(event, actual_t)
-                self.global_records.append(record)
-                self.save_trial_incremental(record)
+                rec = self._build_record(event, actual_t)
+                self.global_records.append(rec)
 
-                # ── Eyetracker ──
+                if not is_burst or event.get("burst_index", 0) == 0:
+                    self.save_trial_incremental(rec)
+
                 if self.eyetracker_actif:
-                    label = event.get("label", event["action"])
+                    lbl = event.get("label", event["action"])
                     self.EyeTracker.send_message(
                         f"R{self.run_number:02d}_"
-                        f"E{i:04d}_"
-                        f"{label.upper()}"
+                        f"E{i:04d}_{lbl.upper()}"
                     )
 
-                # ── Alerte timing (stim uniquement, seuil > 1 ms) ──
-                if is_stim:
-                    err_ms = record["scheduling_error_ms"]
-                    if abs(err_ms) > 1.0:
-                        self.logger.warn(
-                            f"TIMING E{i} "
-                            f"B{event.get('block_index', '?')} "
-                            f"S{event.get('stim_index_in_block', '?')} "
-                            f"({event.get('finger', '?')}): "
-                            f"{err_ms:+.2f} ms"
-                        )
+                if is_burst and abs(rec["scheduling_error_ms"]) > 1.0:
+                    self.logger.warn(
+                        f"TIMING E{i} "
+                        f"{event.get('finger', '?')} "
+                        f"B{event.get('burst_index', '?')}: "
+                        f"{rec['scheduling_error_ms']:+.2f} ms"
+                    )
 
-                # ── Log de progression ──
-                if event.get("label") == "block_on_end":
-                    b = event.get("block_index", "?")
-                    c = event.get("condition", "?")
+                if event["action"] == "stim_omit":
                     self.logger.log(
-                        f"  Block {b} ({c}) ON done  "
+                        f"  Omission {event.get('finger', '?')} "
+                        f"({event.get('condition', '?')}) "
                         f"[t={actual_t:.2f} s]"
+                    )
+
+                if event.get("label") == "run_end":
+                    self.logger.log(
+                        f"  run_end [t={actual_t:.2f} s / "
+                        f"planned {event['onset_s']:.1f} s]"
                     )
 
         finally:
             gc.enable()
             gc.collect()
 
-        self.logger.ok("Timeline execution complete.")
+        self.logger.ok("Exécution de la timeline terminée.")
 
-        # ── Résumé timing ──
-        stim_records = [
+        bursts = [
             r for r in self.global_records
-            if r["action"] in ("stim_deliver", "stim_omit")
+            if r["action"] == "stim_burst"
             and r["scheduling_error_ms"] != ""
         ]
-        if stim_records:
-            errors = [abs(r["scheduling_error_ms"]) for r in stim_records]
-            mean_err = sum(errors) / len(errors)
-            max_err  = max(errors)
-            n_over_05 = sum(1 for e in errors if e > 0.5)
-            n_over_1  = sum(1 for e in errors if e > 1.0)
-            n_over_2  = sum(1 for e in errors if e > 2.0)
+        if bursts:
+            errors = [abs(r["scheduling_error_ms"]) for r in bursts]
+            mean_e = sum(errors) / len(errors)
+            max_e  = max(errors)
+            n_over_1 = sum(1 for e in errors if e > 1.0)
+            n_over_2 = sum(1 for e in errors if e > 2.0)
             self.logger.log(
-                f"Timing summary: {len(stim_records)} stim events | "
-                f"mean |err| = {mean_err:.3f} ms | "
-                f"max |err| = {max_err:.3f} ms | "
-                f">0.5 ms: {n_over_05} | "
-                f">1 ms: {n_over_1} | >2 ms: {n_over_2}"
+                f"Timing résumé : {len(bursts)} bursts | "
+                f"mean |err| = {mean_e:.3f} ms | "
+                f"max |err| = {max_e:.3f} ms | "
+                f">1 ms : {n_over_1} | >2 ms : {n_over_2}"
             )
 
-    # ═════════════════════════════════════════════════════════════════════
+    # =====================================================================
     #  MAIN ENTRY
-    # ═════════════════════════════════════════════════════════════════════
+    # =====================================================================
 
     def run(self) -> None:
         finished = False
@@ -817,19 +725,18 @@ class ConnectElec(BaseTask):
         try:
             self._show_instructions()
             self.wait_for_trigger()
-
             self._execute_timeline()
 
             finished = True
             self.logger.ok(
-                f"Run {self.run_number:02d} ({self.run_type}) done."
+                f"Run {self.run_number:02d} ({self.run_type}) terminé."
             )
 
         except (KeyboardInterrupt, SystemExit):
             self.logger.warn("Interruption manuelle.")
 
         except Exception as exc:
-            self.logger.err(f"CRITICAL: {exc}")
+            self.logger.err(f"CRITICAL : {exc}")
             import traceback
             traceback.print_exc()
             raise
@@ -852,11 +759,9 @@ class ConnectElec(BaseTask):
                     from tasks.qc.qc_connectelec import qc_connectelec
                     qc_connectelec(saved_path)
                 except ImportError:
-                    self.logger.warn("QC module not found (non bloquant)")
+                    self.logger.warn("Module QC non trouvé (non bloquant)")
                 except Exception as qc_exc:
-                    self.logger.warn(
-                        f"QC échoué (non bloquant) : {qc_exc}"
-                    )
+                    self.logger.warn(f"QC échoué (non bloquant) : {qc_exc}")
 
             if finished:
                 self.show_instructions(
@@ -869,22 +774,224 @@ class ConnectElec(BaseTask):
     # ─────────────────────────────────────────────────────────────────────
 
     def _show_instructions(self) -> None:
-        if self.run_type == "mapping":
+        n_vol = int(self.run_duration_s / TR_S)
+        if self.run_type == "somatotopy":
             txt = (
-                f"CARTOGRAPHIE — Run {self.run_number:02d}\n\n"
-                "Faites attention au bout des doigts de la main droite\n"
-                "pendant la phase de stimulation.\n\n"
+                f"SOMATOTOPIE — Run {self.run_number:02d}\n"
+                f"Durée : {self.run_duration_s:.0f} s "
+                f"({n_vol} volumes)\n\n"
+                "Faites attention au bout des doigts de la main droite.\n"
                 "Maintenez votre regard sur la croix de fixation.\n\n"
                 "En attente du scanner …"
             )
         else:
             txt = (
-                f"TÂCHE DE PRÉDICTION — Run {self.run_number:02d}\n\n"
-                "Faites attention au bout des doigts de la main droite\n"
-                "pendant la phase de stimulation.\n\n"
-                "Des instructions spécifiques s'afficheront avant "
-                "chaque bloc.\n"
+                f"PRÉDICTION — Run {self.run_number:02d}\n"
+                f"Durée : {self.run_duration_s:.0f} s "
+                f"({n_vol} volumes)\n\n"
+                "Faites attention au bout des doigts de la main droite.\n"
                 "Maintenez votre regard sur la croix de fixation.\n\n"
                 "En attente du scanner …"
             )
         self.show_instructions(txt)
+
+    # =====================================================================
+    #  STATIC HELPERS (utilisés par le GUI)
+    # =====================================================================
+
+    @staticmethod
+    def get_design_dir(
+        root_dir: str, run_type: str, run_number: int = 1
+    ) -> Optional[str]:
+        run_type = run_type.lower()
+        if run_type in ("somatotopy", "mapping"):
+            key = "somatotopy"
+        else:
+            key = f"prediction_{run_number}"
+
+        rel = DESIGN_PATHS.get(key)
+        if rel is None:
+            return None
+        return os.path.join(root_dir, rel)
+
+    @staticmethod
+    def get_run_duration_s(
+        run_type: str, run_number: int = 1
+    ) -> float:
+        """Retourne la durée hardcodée du run."""
+        run_type = run_type.lower()
+        if run_type in ("somatotopy", "mapping"):
+            key = "somatotopy"
+        else:
+            key = f"prediction_{run_number}"
+        return RUN_DURATIONS_S.get(key, 360.0)
+
+    @staticmethod
+    def compute_run_info(
+        design_dir: str,
+        run_type: str = "somatotopy",
+        run_number: int = 1,
+        tr_s: float = TR_S,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Calcule les infos depuis les fichiers design + durée hardcodée.
+
+        Returns dict avec :
+            run_duration_s, n_volumes, last_stim_end_s, padding_s,
+            n_events, fingers, n_stimulated, n_omissions, conditions
+        """
+        if not design_dir or not os.path.isdir(design_dir):
+            return None
+
+        run_type = run_type.lower()
+
+        if run_type in ("somatotopy", "mapping"):
+            file_info = ConnectElec._compute_somatotopy_info(design_dir)
+        else:
+            file_info = ConnectElec._compute_prediction_info(design_dir)
+
+        if file_info is None:
+            return None
+
+        # Durée hardcodée
+        dur_key = (
+            "somatotopy" if run_type in ("somatotopy", "mapping")
+            else f"prediction_{run_number}"
+        )
+        run_dur = RUN_DURATIONS_S.get(dur_key, 360.0)
+        n_vol   = int(run_dur / tr_s)
+
+        last_end = file_info.pop("last_stim_end_s", 0.0)
+        padding  = run_dur - last_end
+
+        file_info.update({
+            "run_duration_s":   run_dur,
+            "n_volumes":        n_vol,
+            "last_stim_end_s":  round(last_end, 1),
+            "padding_s":        round(padding, 1),
+        })
+
+        return file_info
+
+    @staticmethod
+    def _compute_somatotopy_info(
+        design_dir: str,
+    ) -> Optional[Dict[str, Any]]:
+        import csv as _csv
+
+        fpath = os.path.join(design_dir, SOMATOTOPY_TSV_NAME)
+        if not os.path.exists(fpath):
+            return None
+
+        max_end: float = 0.0
+        n_events: int  = 0
+        fingers: set   = set()
+
+        with open(fpath, "r", encoding="utf-8") as f:
+            reader = _csv.DictReader(f, delimiter="\t")
+            if reader.fieldnames is None:
+                return None
+            for row in reader:
+                try:
+                    onset = float(row["onset"])
+                    dur   = float(row["duration"])
+                    fing  = row["finger"].strip()
+                except (ValueError, KeyError):
+                    continue
+                end = onset + dur
+                if end > max_end:
+                    max_end = end
+                n_events += 1
+                fingers.add(fing)
+
+        if n_events == 0:
+            return None
+
+        return {
+            "last_stim_end_s": max_end,
+            "n_events":        n_events,
+            "fingers":         sorted(fingers),
+            "n_stimulated":    n_events,
+            "n_omissions":     0,
+            "conditions":      ["somatotopy"],
+        }
+
+    @staticmethod
+    def _compute_prediction_info(
+        design_dir: str,
+    ) -> Optional[Dict[str, Any]]:
+        import csv as _csv
+
+        fpath = os.path.join(design_dir, PREDICTION_TSV_NAME)
+        if not os.path.exists(fpath):
+            return None
+
+        max_end: float    = 0.0
+        n_events: int     = 0
+        n_stim: int       = 0
+        n_omit: int       = 0
+        fingers: set      = set()
+        conditions: set   = set()
+
+        with open(fpath, "r", encoding="utf-8") as f:
+            reader = _csv.DictReader(f, delimiter="\t")
+            if reader.fieldnames is None:
+                return None
+
+            for row in reader:
+                try:
+                    onset    = float(row["onset"])
+                    dur      = float(row["duration"])
+                    is_st    = int(row["is_stimulated"]) == 1
+                    is_om    = int(row["is_omission"]) == 1
+                    finger   = row["finger"].strip()
+                    cond     = row["condition"].strip()
+                except (ValueError, KeyError):
+                    continue
+
+                n_events += 1
+                end = onset + dur
+                if end > max_end:
+                    max_end = end
+                fingers.add(finger)
+                conditions.add(cond)
+                if is_st:
+                    n_stim += 1
+                if is_om:
+                    n_omit += 1
+
+        if n_events == 0:
+            return None
+
+        return {
+            "last_stim_end_s": max_end,
+            "n_events":        n_events,
+            "fingers":         sorted(fingers),
+            "n_stimulated":    n_stim,
+            "n_omissions":     n_omit,
+            "conditions":      sorted(conditions),
+        }
+
+    @staticmethod
+    def test_finger(
+        parport: Any,
+        finger_idx: int,
+        delay_s: float = 0.2,
+    ) -> None:
+        """
+        Test manuel :
+            1. send_trigger(pin)     ← sélection
+            2. sleep(200 ms)
+            3. send_trigger(64)      ← stimulation
+            4. send_trigger(0)       ← reset
+        """
+        pin_map = {1: 2, 2: 4, 3: 8, 4: 16, 5: 32}
+        pin = pin_map.get(finger_idx)
+        if pin is None:
+            return
+
+        import time
+        parport.send_trigger(pin)
+        time.sleep(delay_s)
+        parport.send_trigger(STIM_TRIGGER)
+        parport.send_trigger(0)
