@@ -11,8 +11,17 @@ SOMATOTOPIE  → design/somatotopie/somatotopie.tsv
     ex :       13.500  2.5        D1
 
 PREDICTION   → design/prediction/runN/prediction.tsv
-    colonnes : onset  duration  condition  finger  is_stimulated  is_omission
-    ex :       11.700 3.00      FR         D1      1              0
+    colonnes : onset  duration  type  condition  finger  is_omission
+    ex :       10.000 3.000     consigne  FP      NA     0
+               14.000 3.000     stim      FP      D4     0
+               93.764 0.000     stim      TR      D1     1
+
+    type = "consigne"  →  affichage image + texte (finger = NA)
+    type = "stim" + is_omission=0  →  stimulation électrique
+    type = "stim" + is_omission=1  →  omission (duration=0, pas de trigger)
+
+    Images attendues dans : design/prediction/images/
+        FP.png   FR.png   TP.png   TR.png
 
 DURÉES HARDCODÉES :
 ───────────────────
@@ -23,11 +32,14 @@ dernier événement de stimulation.
 ARCHITECTURE :
 ──────────────
 1.  Les timings sont lus depuis les fichiers de design.
-2.  Pour chaque événement stimulé :
+2.  Pour chaque consigne :
+      a. visual_consigne_on  à onset
+      b. visual_consigne_off à onset + duration (retour fixation)
+3.  Pour chaque événement stimulé :
       a. finger_select (pin doigt) à onset − 250 ms
       b. Train de triggers 64 espacés de burst_interval_ms
-3.  Pour chaque omission : un marqueur est enregistré, aucun trigger.
-4.  La timeline complète est pré-calculée avant le trigger IRM.
+4.  Pour chaque omission : un marqueur est enregistré, aucun trigger.
+5.  La timeline complète est pré-calculée avant le trigger IRM.
 
 Fichiers produits :
     *_planned.csv       → timeline planifiée
@@ -60,21 +72,21 @@ FINGER_SWITCH_LEAD_MS: float = 250.0        # fixe
 TR_S: float = 2.0                            # fixe
 
 # ── DURÉES HARDCODÉES (secondes) ──────────────────────────────────────
-#    Modifier ces valeurs pour changer la durée totale de chaque run.
-#    Le run_end marker est placé exactement à cette durée.
 RUN_DURATIONS_S: Dict[str, float] = {
-    "somatotopy":   16*60,      # 5 min
-    "prediction_1": 480.0,      # 6 min
-    "prediction_2": 480.0,      # 6 min
-    "prediction_3": 480.0,      # 6 min
+    "somatotopy":   16 * 60,    # 16 min
+    "prediction_1": 772.0 + 10.0,      # 8 min
+    "prediction_2": 786.0 + 10.0,
+    "prediction_3": 794.0 + 10.0,
 }
 
 _ACTION_PRIORITY: Dict[str, int] = {
-    "visual_fixation": 0,
-    "finger_select":   1,
-    "marker":          2,
-    "stim_burst":      3,
-    "stim_omit":       3,
+    "visual_consigne_off": -1,   # nettoyage avant tout autre visuel
+    "visual_fixation":      0,
+    "visual_consigne_on":   0,
+    "finger_select":        1,
+    "marker":               2,
+    "stim_burst":           3,
+    "stim_omit":            3,
 }
 
 DESIGN_PATHS: Dict[str, str] = {
@@ -86,6 +98,35 @@ DESIGN_PATHS: Dict[str, str] = {
 
 SOMATOTOPY_TSV_NAME: str = "somatotopie.tsv"
 PREDICTION_TSV_NAME: str = "prediction.tsv"
+
+# ── Consignes visuelles (prediction uniquement) ─────────────────────────
+CONSIGNE_TEXTS: Dict[str, str] = {
+    "FP": (
+        "Faites attention à la stimulation de chaque doigt et prédisez\n"
+        "quand l'index sera stimulé selon le rythme temporel."
+    ),
+    "TP": (
+        "Faites attention à la stimulation de chaque doigt et prédisez\n"
+        "quand l'index sera stimulé, même si aucune stimulation "
+        "n'est délivrée."
+    ),
+    "FR": (
+        "Faites attention à la stimulation de chaque doigt,\n"
+        "mais n'essayez pas de prédire un motif rythmique ou temporel."
+    ),
+    "TR": (
+        "Faites attention à la stimulation de chaque doigt,\n"
+        "mais n'essayez pas de prédire un motif rythmique ou temporel."
+    ),
+}
+CONSIGNE_IMAGES_DIR: str = os.path.join("images")
+_CONSIGNE_IMG_EXTENSIONS: tuple = (".png", ".jpg", ".jpeg", ".bmp")
+
+# ── Layout consigne (unités norm : −1 → +1) ─────────────────────────────
+CONSIGNE_IMG_POS: tuple    = (0.0, 0.25)
+CONSIGNE_IMG_SIZE: tuple   = (0.50, 0.50)
+CONSIGNE_TXT_POS: tuple    = (0.0, -0.15)
+CONSIGNE_TXT_HEIGHT: float = 0.055
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -153,6 +194,10 @@ class ConnectElec(BaseTask):
         self.global_records: List[Dict[str, Any]] = []
         self.timeline: List[Dict[str, Any]] = []
 
+        # ── consigne visuals (prediction only) ────────────────────────────
+        self._consigne_images: Dict[str, visual.ImageStim] = {}
+        self._consigne_texts:  Dict[str, visual.TextStim]  = {}
+
         # ── init chain ────────────────────────────────────────────────────
         self._detect_display_scaling()
         self._measure_frame_rate()
@@ -163,6 +208,8 @@ class ConnectElec(BaseTask):
 
         # ── LOAD FILES & BUILD TIMELINE ──────────────────────────────────
         self._design_dir: str = self._resolve_design_dir()
+        if self.run_type != "somatotopy":
+            self._load_consigne_visuals()
         self._stim_events: List[Dict[str, Any]] = self._load_stim_events()
         self._build_full_timeline()
         self._save_planned_timeline()
@@ -204,6 +251,67 @@ class ConnectElec(BaseTask):
             self.key_continue = "space"
 
     # =====================================================================
+    #  CONSIGNE VISUAL LOADING
+    # =====================================================================
+
+    def _load_consigne_visuals(self) -> None:
+        """
+        Charge les images et crée les TextStim pour chaque condition
+        de consigne (FP, FR, TP, TR).
+
+        Images cherchées dans :
+            {root_dir}/design/prediction/images/<COND>.{png,jpg,…}
+
+        Textes définis dans CONSIGNE_TEXTS (module-level).
+        """
+        images_dir = os.path.join(self.root_dir, CONSIGNE_IMAGES_DIR)
+
+        for cond, label in CONSIGNE_TEXTS.items():
+            # ── Image ────────────────────────────────────────────────
+            img_path: Optional[str] = None
+            for ext in _CONSIGNE_IMG_EXTENSIONS:
+                candidate = os.path.join(images_dir, f"{cond}{ext}")
+                if os.path.exists(candidate):
+                    img_path = candidate
+                    break
+
+            if img_path is not None:
+                try:
+                    self._consigne_images[cond] = visual.ImageStim(
+                        self.win,
+                        image=img_path,
+                        pos=CONSIGNE_IMG_POS,
+                        size=CONSIGNE_IMG_SIZE,
+                        units="norm",
+                    )
+                except Exception as exc:
+                    self.logger.warn(
+                        f"Image {cond} non chargée : {exc}"
+                    )
+            else:
+                self.logger.warn(
+                    f"Image consigne manquante : "
+                    f"{images_dir}/{cond}.*"
+                )
+
+            # ── Texte ────────────────────────────────────────────────
+            self._consigne_texts[cond] = visual.TextStim(
+                self.win,
+                text=label,
+                pos=CONSIGNE_TXT_POS,
+                height=CONSIGNE_TXT_HEIGHT,
+                color="white",
+                units="norm",
+                wrapWidth=1.6,
+            )
+
+        loaded_imgs = sorted(self._consigne_images.keys())
+        self.logger.log(
+            f"Consigne visuals : {len(self._consigne_texts)} textes, "
+            f"{len(self._consigne_images)} images {loaded_imgs}"
+        )
+
+    # =====================================================================
     #  DESIGN FILE LOADING
     # =====================================================================
 
@@ -238,7 +346,7 @@ class ConnectElec(BaseTask):
 
         if not events:
             raise ValueError(
-                f"Aucun événement de stimulation dans {self._design_dir}"
+                f"Aucun événement dans {self._design_dir}"
             )
 
         events.sort(key=lambda e: e["onset_s"])
@@ -313,8 +421,9 @@ class ConnectElec(BaseTask):
                     "onset_s":       onset_s,
                     "duration_s":    duration_s,
                     "condition":     "somatotopy",
-                    "is_stimulated": True,
+                    "event_type":    "stim",
                     "is_omission":   False,
+                    "is_consigne":   False,
                 })
 
         self.logger.log(
@@ -328,7 +437,11 @@ class ConnectElec(BaseTask):
     def _load_prediction_tsv(self) -> List[Dict[str, Any]]:
         """
         Format TSV avec header :
-            onset  duration  condition  finger  is_stimulated  is_omission
+            onset  duration  type  condition  finger  is_omission
+
+        type = "consigne"  → affichage image + texte (finger = NA)
+        type = "stim" + is_omission=0  → stimulation électrique
+        type = "stim" + is_omission=1  → omission (duration=0)
         """
         fpath = os.path.join(self._design_dir, PREDICTION_TSV_NAME)
         if not os.path.exists(fpath):
@@ -347,8 +460,8 @@ class ConnectElec(BaseTask):
                 raise ValueError(f"Fichier vide : {fpath}")
 
             required = {
-                "onset", "duration", "condition",
-                "finger", "is_stimulated", "is_omission",
+                "onset", "duration", "type",
+                "condition", "finger", "is_omission",
             }
             actual = set(reader.fieldnames)
             missing = required - actual
@@ -360,12 +473,12 @@ class ConnectElec(BaseTask):
 
             for row_num, row in enumerate(reader, start=2):
                 try:
-                    onset_s       = float(row["onset"])
-                    duration_s    = float(row["duration"])
-                    condition     = row["condition"].strip()
-                    finger        = row["finger"].strip()
-                    is_stimulated = int(row["is_stimulated"]) == 1
-                    is_omission   = int(row["is_omission"]) == 1
+                    onset_s     = float(row["onset"])
+                    duration_s  = float(row["duration"])
+                    event_type  = row["type"].strip().lower()
+                    condition   = row["condition"].strip()
+                    finger_raw  = row["finger"].strip()
+                    is_omission = int(row["is_omission"]) == 1
                 except (ValueError, KeyError) as exc:
                     self.logger.warn(
                         f"{PREDICTION_TSV_NAME}:{row_num} — "
@@ -373,30 +486,43 @@ class ConnectElec(BaseTask):
                     )
                     continue
 
-                if finger not in FINGER_PIN_MAP:
-                    self.logger.warn(
-                        f"{PREDICTION_TSV_NAME}:{row_num} — "
-                        f"doigt inconnu '{finger}', ignoré"
-                    )
-                    continue
+                is_consigne = event_type == "consigne"
+                is_stim     = event_type == "stim" and not is_omission
+
+                # Finger : "NA" ou vide accepté pour consignes
+                finger = finger_raw if finger_raw.upper() != "NA" else ""
+
+                # Doigt obligatoire pour stim / omission
+                if not is_consigne:
+                    if finger not in FINGER_PIN_MAP:
+                        self.logger.warn(
+                            f"{PREDICTION_TSV_NAME}:{row_num} — "
+                            f"doigt inconnu '{finger_raw}', ignoré"
+                        )
+                        continue
 
                 conditions_seen.add(condition)
-                fingers_seen.add(finger)
+                if finger in FINGER_PIN_MAP:
+                    fingers_seen.add(finger)
 
                 events.append({
-                    "finger":        finger,
-                    "onset_s":       onset_s,
-                    "duration_s":    duration_s,
-                    "condition":     condition,
-                    "is_stimulated": is_stimulated,
-                    "is_omission":   is_omission,
+                    "finger":      finger,
+                    "onset_s":     onset_s,
+                    "duration_s":  duration_s,
+                    "condition":   condition,
+                    "event_type":  event_type,
+                    "is_omission": is_omission,
+                    "is_consigne": is_consigne,
+                    "is_stim":     is_stim,
                 })
 
-        n_stim = sum(1 for e in events if e["is_stimulated"])
-        n_omit = sum(1 for e in events if e["is_omission"])
+        n_stim    = sum(1 for e in events if e["is_stim"])
+        n_omit    = sum(1 for e in events if e["is_omission"])
+        n_consign = sum(1 for e in events if e["is_consigne"])
         self.logger.log(
             f"Prediction : {len(events)} événements "
-            f"({n_stim} stimulés, {n_omit} omissions) | "
+            f"({n_stim} stimulés, {n_omit} omissions, "
+            f"{n_consign} consignes) | "
             f"conditions : {sorted(conditions_seen)} | "
             f"doigts : {sorted(fingers_seen)}"
         )
@@ -419,15 +545,18 @@ class ConnectElec(BaseTask):
         """
         Construit la timeline complète.
 
-        Pour chaque événement STIMULÉ :
+        Pour chaque CONSIGNE :
+          1. visual_consigne_on   à onset
+          2. visual_consigne_off  à onset + duration  (→ retour fixation)
+
+        Pour chaque STIM (is_omission=0) :
           1. finger_select   à onset − 250 ms
           2. stim_burst × N  à onset + i × burst_interval
 
-        Pour chaque OMISSION :
+        Pour chaque OMISSION (is_omission=1) :
           1. stim_omit (marqueur seul)
 
-        La timeline se termine à self.run_duration_s (hardcodé),
-        ce qui assure un padding post-stim constant.
+        La timeline se termine à self.run_duration_s (hardcodé).
         """
         self.timeline.clear()
 
@@ -437,17 +566,36 @@ class ConnectElec(BaseTask):
                         run_number=self.run_number)
         self._add_event(0.0, "visual_fixation", label="fixation_start")
 
-        # ── Événements de stimulation ──
+        # ── Événements ──
         for ei, stim in enumerate(self._stim_events):
-            onset      = stim["onset_s"]
-            duration   = stim["duration_s"]
-            finger     = stim["finger"]
-            condition  = stim.get("condition", "")
-            is_stim    = stim["is_stimulated"]
-            is_omit    = stim["is_omission"]
-            pin        = self.finger_pin_map[finger]
+            onset       = stim["onset_s"]
+            duration    = stim["duration_s"]
+            finger      = stim["finger"]
+            condition   = stim.get("condition", "")
+            is_consigne = stim.get("is_consigne", False)
+            is_stim     = stim.get("is_stim", False)
+            is_omit     = stim.get("is_omission", False)
 
-            if is_stim and duration > 0:
+            if is_consigne:
+                # ── Consigne visuelle ON ──
+                self._add_event(
+                    onset, "visual_consigne_on",
+                    label="consigne_on",
+                    condition=condition,
+                    stim_event_idx=ei,
+                    duration_s=duration,
+                )
+                # ── Consigne visuelle OFF → retour fixation ──
+                self._add_event(
+                    onset + duration, "visual_consigne_off",
+                    label="consigne_off",
+                    condition=condition,
+                    stim_event_idx=ei,
+                )
+
+            elif is_stim and duration > 0:
+                pin = self.finger_pin_map[finger]
+
                 # ── Sélection du doigt ──
                 sel_t = max(0.0, onset - self.finger_switch_lead_s)
                 self._add_event(
@@ -461,7 +609,8 @@ class ConnectElec(BaseTask):
 
                 # ── Train de bursts ──
                 n_bursts = max(
-                    1, int(duration / self.burst_interval_s + 1e-9) + 1
+                    1,
+                    int(duration / self.burst_interval_s + 1e-9) + 1,
                 )
                 for bi in range(n_bursts):
                     burst_t = onset + bi * self.burst_interval_s
@@ -494,7 +643,7 @@ class ConnectElec(BaseTask):
 
             else:
                 self.logger.warn(
-                    f"Événement {ei} ignoré (ni stimulé ni omission)"
+                    f"Événement {ei} ignoré (type inconnu)"
                 )
 
         # ── Run end : durée hardcodée ──
@@ -515,12 +664,14 @@ class ConnectElec(BaseTask):
             evt["event_index"] = i
 
         # ── Résumé ──
-        n_sel   = sum(1 for e in self.timeline
-                      if e["action"] == "finger_select")
-        n_burst = sum(1 for e in self.timeline
-                      if e["action"] == "stim_burst")
-        n_omit  = sum(1 for e in self.timeline
-                      if e["action"] == "stim_omit")
+        n_sel    = sum(1 for e in self.timeline
+                       if e["action"] == "finger_select")
+        n_burst  = sum(1 for e in self.timeline
+                       if e["action"] == "stim_burst")
+        n_omit   = sum(1 for e in self.timeline
+                       if e["action"] == "stim_omit")
+        n_con_on = sum(1 for e in self.timeline
+                       if e["action"] == "visual_consigne_on")
 
         last_stim = max(
             (e["onset_s"] + e.get("duration_s", 0)
@@ -531,8 +682,9 @@ class ConnectElec(BaseTask):
 
         self.logger.log(
             f"Timeline : {len(self.timeline)} events "
-            f"({n_sel} select, {n_burst} burst, {n_omit} omit) | "
-            f"last stim ends at {last_stim:.1f} s | "
+            f"({n_sel} select, {n_burst} burst, {n_omit} omit, "
+            f"{n_con_on} consignes) | "
+            f"last event ends at {last_stim:.1f} s | "
             f"padding = {padding:.1f} s | "
             f"run_end = {self.run_duration_s:.1f} s"
         )
@@ -585,10 +737,52 @@ class ConnectElec(BaseTask):
         else:
             core.wait(remaining, hogCPUperiod=0.0)
 
+    # ─────────────────────────────────────────────────────────────────────
+    #  CONSIGNE DRAWING HELPER
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _draw_consigne(self, condition: str) -> None:
+        """
+        Dessine l'image de la condition (au-dessus) puis le texte
+        descriptif (en-dessous), et flip.
+
+        Si l'image est manquante seul le texte est affiché.
+        Si la condition est inconnue un fallback texte brut est utilisé.
+        """
+        if condition in self._consigne_images:
+            self._consigne_images[condition].draw()
+
+        if condition in self._consigne_texts:
+            self._consigne_texts[condition].draw()
+        else:
+            fallback = visual.TextStim(
+                self.win,
+                text=condition,
+                pos=CONSIGNE_TXT_POS,
+                height=CONSIGNE_TXT_HEIGHT,
+                color="white",
+                units="norm",
+            )
+            fallback.draw()
+
+        self.win.flip()
+
+    # ─────────────────────────────────────────────────────────────────────
+
     def _dispatch_event(self, event: Dict[str, Any]) -> float:
         action = event["action"]
 
         if action == "visual_fixation":
+            self.fixation.draw()
+            self.win.flip()
+            return self.task_clock.getTime()
+
+        if action == "visual_consigne_on":
+            t = self.task_clock.getTime()
+            self._draw_consigne(event.get("condition", ""))
+            return t
+
+        if action == "visual_consigne_off":
             self.fixation.draw()
             self.win.flip()
             return self.task_clock.getTime()
@@ -670,6 +864,7 @@ class ConnectElec(BaseTask):
                         f"E{i:04d}_{lbl.upper()}"
                     )
 
+                # ── Logging conditionnel ──
                 if is_burst and abs(rec["scheduling_error_ms"]) > 1.0:
                     self.logger.warn(
                         f"TIMING E{i} "
@@ -682,6 +877,20 @@ class ConnectElec(BaseTask):
                     self.logger.log(
                         f"  Omission {event.get('finger', '?')} "
                         f"({event.get('condition', '?')}) "
+                        f"[t={actual_t:.2f} s]"
+                    )
+
+                if event["action"] == "visual_consigne_on":
+                    self.logger.log(
+                        f"  Consigne ON : {event.get('condition', '?')} "
+                        f"[t={actual_t:.2f} s, "
+                        f"dur={event.get('duration_s', '?')} s]"
+                    )
+
+                if event["action"] == "visual_consigne_off":
+                    self.logger.log(
+                        f"  Consigne OFF : "
+                        f"{event.get('condition', '?')} "
                         f"[t={actual_t:.2f} s]"
                     )
 
@@ -835,10 +1044,6 @@ class ConnectElec(BaseTask):
     ) -> Optional[Dict[str, Any]]:
         """
         Calcule les infos depuis les fichiers design + durée hardcodée.
-
-        Returns dict avec :
-            run_duration_s, n_volumes, last_stim_end_s, padding_s,
-            n_events, fingers, n_stimulated, n_omissions, conditions
         """
         if not design_dir or not os.path.isdir(design_dir):
             return None
@@ -853,7 +1058,6 @@ class ConnectElec(BaseTask):
         if file_info is None:
             return None
 
-        # Durée hardcodée
         dur_key = (
             "somatotopy" if run_type in ("somatotopy", "mapping")
             else f"prediction_{run_number}"
@@ -913,6 +1117,7 @@ class ConnectElec(BaseTask):
             "fingers":         sorted(fingers),
             "n_stimulated":    n_events,
             "n_omissions":     0,
+            "n_consignes":     0,
             "conditions":      ["somatotopy"],
         }
 
@@ -920,6 +1125,10 @@ class ConnectElec(BaseTask):
     def _compute_prediction_info(
         design_dir: str,
     ) -> Optional[Dict[str, Any]]:
+        """
+        Lit prediction.tsv (colonnes : onset duration type condition
+        finger is_omission) et calcule les stats.
+        """
         import csv as _csv
 
         fpath = os.path.join(design_dir, PREDICTION_TSV_NAME)
@@ -930,6 +1139,7 @@ class ConnectElec(BaseTask):
         n_events: int     = 0
         n_stim: int       = 0
         n_omit: int       = 0
+        n_consign: int    = 0
         fingers: set      = set()
         conditions: set   = set()
 
@@ -940,12 +1150,12 @@ class ConnectElec(BaseTask):
 
             for row in reader:
                 try:
-                    onset    = float(row["onset"])
-                    dur      = float(row["duration"])
-                    is_st    = int(row["is_stimulated"]) == 1
-                    is_om    = int(row["is_omission"]) == 1
-                    finger   = row["finger"].strip()
-                    cond     = row["condition"].strip()
+                    onset      = float(row["onset"])
+                    dur        = float(row["duration"])
+                    event_type = row["type"].strip().lower()
+                    is_om      = int(row["is_omission"]) == 1
+                    finger_raw = row["finger"].strip()
+                    cond       = row["condition"].strip()
                 except (ValueError, KeyError):
                     continue
 
@@ -953,12 +1163,22 @@ class ConnectElec(BaseTask):
                 end = onset + dur
                 if end > max_end:
                     max_end = end
-                fingers.add(finger)
+
+                finger = (
+                    finger_raw
+                    if finger_raw.upper() != "NA"
+                    else ""
+                )
+                if finger in FINGER_PIN_MAP:
+                    fingers.add(finger)
                 conditions.add(cond)
-                if is_st:
-                    n_stim += 1
-                if is_om:
+
+                if event_type == "consigne":
+                    n_consign += 1
+                elif is_om:
                     n_omit += 1
+                else:
+                    n_stim += 1
 
         if n_events == 0:
             return None
@@ -969,6 +1189,7 @@ class ConnectElec(BaseTask):
             "fingers":         sorted(fingers),
             "n_stimulated":    n_stim,
             "n_omissions":     n_omit,
+            "n_consignes":     n_consign,
             "conditions":      sorted(conditions),
         }
 

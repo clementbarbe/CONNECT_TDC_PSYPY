@@ -2,8 +2,15 @@
 """
 PyQt6 control panel for ConnectElec — 7T somatotopy / prediction.
 
-SOMATOTOPIE :  design/somatotopie/somatotopie.tsv   (onset  duration  finger)
-PREDICTION  :  design/prediction/runN/prediction.tsv (onset  duration  condition  finger  is_stimulated  is_omission)
+SOMATOTOPIE :  design/somatotopie/somatotopie.tsv
+    colonnes : onset  duration  finger
+
+PREDICTION  :  design/prediction/runN/prediction.tsv
+    colonnes : onset  duration  type  condition  finger  is_omission
+
+    type = "consigne"  →  affichage image + texte (finger = NA)
+    type = "stim" + is_omission=0  →  stimulation électrique
+    type = "stim" + is_omission=1  →  omission (duration=0)
 """
 
 import os
@@ -215,9 +222,9 @@ class ConnectElecTab(QWidget):
             )
             if info is None:
                 if rtype == "somatotopy":
-                    expected = f"somatotopie.tsv"
+                    expected = "somatotopie.tsv"
                 else:
-                    expected = f"prediction.tsv"
+                    expected = "prediction.tsv"
                 self.run_info_labels[i].setText(
                     f"❌ {expected} manquant\n    {ddir}"
                 )
@@ -230,11 +237,18 @@ class ConnectElecTab(QWidget):
                     f"{info['n_events']} events",
                 ]
 
-                if info.get("n_omissions", 0) > 0:
-                    parts.append(
-                        f"{info['n_stimulated']} stim / "
-                        f"{info['n_omissions']} omit"
-                    )
+                # ── Détail stim / omit / consignes ───────────────────
+                n_stim    = info.get("n_stimulated", 0)
+                n_omit    = info.get("n_omissions", 0)
+                n_consign = info.get("n_consignes", 0)
+
+                if n_omit > 0 or n_consign > 0:
+                    detail = f"{n_stim} stim"
+                    if n_omit > 0:
+                        detail += f" / {n_omit} omit"
+                    if n_consign > 0:
+                        detail += f" / {n_consign} cue"
+                    parts.append(detail)
 
                 if (info.get("conditions")
                         and info["conditions"] != ["somatotopy"]):
@@ -328,7 +342,7 @@ class ConnectElecTab(QWidget):
             )
             return
 
-        dur     = info["run_duration_s"]
+        dur = info["run_duration_s"]
         details = (
             f"{run_type.upper()} — Run {run_number:02d}\n\n"
             f"Durée totale :     {dur:.0f} s ({dur / 60:.1f} min)\n"
@@ -338,16 +352,24 @@ class ConnectElecTab(QWidget):
             f"Dernier stim fin : {info['last_stim_end_s']:.1f} s\n"
             f"Padding post-stim: {info['padding_s']:.1f} s\n"
         )
-        if info.get("n_omissions", 0) > 0:
-            details += (
-                f"Stimulés :         {info['n_stimulated']}\n"
-                f"Omissions :        {info['n_omissions']}\n"
-            )
+
+        # ── Détail stim / omit / consignes ───────────────────────────
+        n_stim    = info.get("n_stimulated", 0)
+        n_omit    = info.get("n_omissions", 0)
+        n_consign = info.get("n_consignes", 0)
+
+        details += f"Stimulations :     {n_stim}\n"
+        if n_omit > 0:
+            details += f"Omissions :        {n_omit}\n"
+        if n_consign > 0:
+            details += f"Consignes :        {n_consign}\n"
+
         if (info.get("conditions")
                 and info["conditions"] != ["somatotopy"]):
             details += (
                 f"Conditions :       {', '.join(info['conditions'])}\n"
             )
+
         details += (
             f"Burst interval :   {self.spin_burst.value():.0f} ms\n\n"
             f"Lancer ?"
