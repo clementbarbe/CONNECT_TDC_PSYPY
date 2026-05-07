@@ -573,8 +573,15 @@ class ConnectElec(BaseTask):
             finger      = stim["finger"]
             condition   = stim.get("condition", "")
             is_consigne = stim.get("is_consigne", False)
-            is_stim     = stim.get("is_stim", False)
             is_omit     = stim.get("is_omission", False)
+
+            # ── Déterminer si c'est une stim réelle ──
+            # Somatotopie : pas de clé "is_stim" → toute ligne
+            # non-consigne et non-omission est une stim
+            if "is_stim" in stim:
+                is_stim = stim["is_stim"]
+            else:
+                is_stim = (not is_consigne and not is_omit)
 
             if is_consigne:
                 # ── Consigne visuelle ON ──
@@ -643,7 +650,8 @@ class ConnectElec(BaseTask):
 
             else:
                 self.logger.warn(
-                    f"Événement {ei} ignoré (type inconnu)"
+                    f"Événement {ei} ignoré (ni consigne, ni stim, "
+                    f"ni omission)"
                 )
 
         # ── Run end : durée hardcodée ──
