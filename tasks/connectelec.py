@@ -120,7 +120,7 @@ CONTROLE_INSTR_DURATION_S: float = 5.0
 CONTROLE_BUTTON_IMAGE_NAMES: tuple = ("B1.png", "B2.png", "B3.png", "B4.png")
 CONTROLE_BUTTON_DISPLAY_S: float  = 1.0
 CONTROLE_BUTTON_IMG_POS: tuple    = (0.0, 0.0)
-CONTROLE_BUTTON_IMG_SIZE: tuple   = (0.50, 0.50)
+CONTROLE_BUTTON_IMG_SIZE: tuple   = (1/1.6,1.0)
 CONTROLE_INSTR_POS: tuple         = (0.0, 0.0)
 CONTROLE_INSTR_HEIGHT: float      = 0.07
 
