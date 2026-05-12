@@ -21,6 +21,14 @@ PREDICTION   → design/prediction/runN/prediction.tsv
 TERMINOLOGIE :
   • CONSIGNE  = instruction prédictive (FP, FR, TP, TR) — image + texte
   • CONTROLE  = sous-tâche boutons (B1–B4) main gauche
+
+SORTIES :
+  1. CSV complet : tous les événements bruts (burst start/end, markers, boutons…)
+  2. TSV events  : miroir du design d'entrée avec timings réels mesurés
+     – stimulations : onset/duration effectifs
+     – omissions    : finger = Dx_omitted, duration = 0.5 s
+     – consignes    : onset/duration effectifs
+     – contrôles    : onset/duration effectifs
 """
 
 from __future__ import annotations
@@ -50,10 +58,10 @@ TR_S: float = 2.0
 BACKGROUND_COLOR: list = [0, 0, 0]  # mid-grey PsychoPy (-1..+1)
 
 RUN_DURATIONS_S: Dict[str, float] = {
-    "somatotopy":   16 * 60,
-    "prediction_1": 715 + 10.0,
-    "prediction_2": 715 + 10.0,
-    "prediction_3": 715 + 10.0,
+    "somatotopy":   960,
+    "prediction_1": 750,
+    "prediction_2": 750,
+    "prediction_3": 750
 }
 
 _ACTION_PRIORITY: Dict[str, int] = {
@@ -101,8 +109,8 @@ CONSIGNE_TEXTS: Dict[str, str] = {
 CONSIGNE_IMAGES_DIR: str = os.path.join("images")
 _CONSIGNE_IMG_EXTENSIONS: tuple = (".png", ".jpg", ".jpeg", ".bmp")
 
-CONSIGNE_IMG_POS: tuple    = (0.0, 0.25)
-CONSIGNE_IMG_SIZE: tuple   = (0.50, 0.50)
+CONSIGNE_IMG_POS: tuple    = (0.0, 0.0)
+CONSIGNE_IMG_SIZE: tuple   = (1.0/1.6, 1.0)
 CONSIGNE_TXT_POS: tuple    = (0.0, -0.15)
 CONSIGNE_TXT_HEIGHT: float = 0.055
 
@@ -117,11 +125,10 @@ CONTROLE_INSTR_POS: tuple         = (0.0, 0.0)
 CONTROLE_INSTR_HEIGHT: float      = 0.07
 
 # ── Sous-tâche CONTRÔLE : mapping bouton-box fMRI ───────────────────────
-# La button box envoie b, y, g, r pour les 4 boutons
 BUTTON_RESPONSE_KEYS: tuple = (
-    "b", "y", "g", "r",           # fMRI button box
-    "1", "2", "3", "4",           # clavier normal
-    "num_1", "num_2", "num_3", "num_4",  # numpad
+    "b", "y", "g", "r",
+    "1", "2", "3", "4",
+    "num_1", "num_2", "num_3", "num_4",
 )
 
 BUTTON_CORRECT_MAP: Dict[str, tuple] = {
@@ -131,10 +138,7 @@ BUTTON_CORRECT_MAP: Dict[str, tuple] = {
     "B4.png": ("r", "4", "num_4"),
 }
 
-# ═══════════════════════════════════════════════════════════════
-# Constante à ajouter après BUTTON_CORRECT_MAP (module-level)
-# ═══════════════════════════════════════════════════════════════
-
+# ── Reverse mapping touche → numéro bouton ──────────────────────────────
 _KEY_TO_BUTTON: Dict[str, str] = {}
 for _img_name, _accepted_keys in BUTTON_CORRECT_MAP.items():
     _btn_num = _img_name.replace("B", "").replace(".png", "")
@@ -143,6 +147,9 @@ for _img_name, _accepted_keys in BUTTON_CORRECT_MAP.items():
 
 # Quit keys vérifiés dans la boucle contrôle
 _QUIT_KEYS: tuple = ("escape", "q")
+
+# ── Durée fictive pour omissions dans le TSV events ─────────────────────
+OMISSION_DURATION_S: float = 0.5
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -699,6 +706,128 @@ class ConnectElec(BaseTask):
             self.logger.err(f"Sauvegarde planned échouée : {exc}")
 
     # =====================================================================
+    #  BIDS-LIKE EVENTS TSV (timings réels)
+    # =====================================================================
+
+    def _save_bids_events(self) -> Optional[str]:
+        """
+        Sauvegarde un TSV simplifié miroir du design d'entrée,
+        mais avec les timings réellement mesurés.
+
+        Somatotopie → colonnes : onset  duration  finger
+        Prédiction  → colonnes : onset  duration  type  condition  finger  is_omission
+
+        • Stimulations : onset/duration réels (burst_start → burst_end)
+        • Omissions    : finger = « Dx_omitted », duration = OMISSION_DURATION_S
+        • Consignes    : onset/duration réels (on → off)
+        • Contrôles    : onset/duration réels (on → off)
+        """
+        if not self.enregistrer or not self.global_records:
+            return None
+
+        # ── Index des records par stim_event_idx ──────────────────────
+        by_idx: Dict[int, List[Dict[str, Any]]] = {}
+        for rec in self.global_records:
+            idx = rec.get("stim_event_idx")
+            if idx == "" or idx is None:
+                continue
+            by_idx.setdefault(idx, []).append(rec)
+
+        rows: List[Dict[str, Any]] = []
+
+        for ei, stim in enumerate(self._stim_events):
+            recs    = by_idx.get(ei, [])
+            onset   = stim["onset_s"]       # fallback : planifié
+            dur     = stim["duration_s"]     # fallback : planifié
+            finger  = stim.get("finger", "")
+            cond    = stim.get("condition", "")
+            etype   = stim.get("event_type", "")
+            is_omit = stim.get("is_omission", False)
+
+            # ── Stimulation effective ────────────────────────────────
+            if stim.get("is_stim") and not is_omit:
+                starts = [r for r in recs if r.get("label") == "burst_start"]
+                ends   = [r for r in recs if r.get("label") == "burst_end"]
+                if starts:
+                    onset = starts[0]["onset_actual_s"]
+                if starts and ends:
+                    measured = ends[0]["onset_actual_s"] - starts[0]["onset_actual_s"]
+                    dur = measured if measured > 0 else stim["duration_s"]
+
+            # ── Omission ─────────────────────────────────────────────
+            elif is_omit:
+                omits = [r for r in recs if r["action"] == "stim_omit"]
+                if omits:
+                    onset = omits[0]["onset_actual_s"]
+                dur    = OMISSION_DURATION_S
+                finger = f"{finger}_omitted" if finger else "omitted"
+
+            # ── Consigne ─────────────────────────────────────────────
+            elif stim.get("is_consigne"):
+                ons  = [r for r in recs if r["action"] == "visual_consigne_on"]
+                offs = [r for r in recs if r["action"] == "visual_consigne_off"]
+                if ons:
+                    onset = ons[0]["onset_actual_s"]
+                if ons and offs:
+                    dur = offs[0]["onset_actual_s"] - ons[0]["onset_actual_s"]
+
+            # ── Contrôle ─────────────────────────────────────────────
+            elif stim.get("is_controle"):
+                ons  = [r for r in recs if r["action"] == "visual_controle_on"]
+                offs = [r for r in recs if r["action"] == "visual_controle_off"]
+                if ons:
+                    onset = ons[0]["onset_actual_s"]
+                if ons and offs:
+                    dur = offs[0]["onset_actual_s"] - ons[0]["onset_actual_s"]
+
+            # ── Construire la ligne ──────────────────────────────────
+            if self.run_type == "somatotopy":
+                rows.append({
+                    "onset":    round(onset, 3),
+                    "duration": round(dur, 3),
+                    "finger":   "controle" if stim.get("is_controle") else finger,
+                })
+            else:  # prediction
+                rows.append({
+                    "onset":       round(onset, 3),
+                    "duration":    round(dur, 3),
+                    "type":        etype,
+                    "condition":   cond,
+                    "finger":      finger if finger else "NA",
+                    "is_omission": int(is_omit),
+                })
+
+        if not rows:
+            self.logger.warn("Aucun événement à écrire dans le TSV events.")
+            return None
+
+        # ── Écriture TSV ─────────────────────────────────────────────
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = (
+            f"{self.nom}_{self.task_name}"
+            f"_{self.run_type}_run{self.run_number:02d}"
+            f"_{ts}_events.tsv"
+        )
+        path = os.path.join(self.data_dir, fname)
+
+        fieldnames = list(rows[0].keys())
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(
+                    f, fieldnames=fieldnames,
+                    delimiter="\t", extrasaction="ignore",
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+            self.logger.ok(
+                f"Events TSV : {path} ({len(rows)} événements)"
+            )
+            return path
+        except Exception as exc:
+            self.logger.err(f"Events TSV — échec : {exc}")
+            return None
+
+    # =====================================================================
     #  EXECUTION ENGINE
     # =====================================================================
 
@@ -718,10 +847,6 @@ class ConnectElec(BaseTask):
     #  CONSIGNE DRAWING (prediction : FP, FR, TP, TR)
     # ─────────────────────────────────────────────────────────────────────
 
-    # ═══════════════════════════════════════════════════════════════
-    # Remplacer _draw_consigne (plus de texte, image seule)
-    # ═══════════════════════════════════════════════════════════════
-
     def _draw_consigne(self, condition: str) -> None:
         self._draw_bg()
         if condition in self._consigne_images:
@@ -740,10 +865,6 @@ class ConnectElec(BaseTask):
     # ─────────────────────────────────────────────────────────────────────
     #  SOUS-TÂCHE CONTRÔLE (boutons B1–B4)
     # ─────────────────────────────────────────────────────────────────────
-
-    # ═══════════════════════════════════════════════════════════════
-    # Remplacer _process_keys_in_controle
-    # ═══════════════════════════════════════════════════════════════
 
     def _process_keys_in_controle(
         self,
@@ -814,9 +935,6 @@ class ConnectElec(BaseTask):
                 f"(key='{k.name}', image={current_image}, "
                 f"correct={is_correct}, RT={rt:.3f} s)"
             )
-    # ═══════════════════════════════════════════════════════════════
-    # Remplacer _run_controle_subtask
-    # ═══════════════════════════════════════════════════════════════
 
     def _run_controle_subtask(self, event: Dict[str, Any]) -> float:
         onset_planned: float = event["onset_s"]
@@ -957,10 +1075,6 @@ class ConnectElec(BaseTask):
             "button_correct":      "",
             "button_rt_s":         "",
         }
-
-    # ═══════════════════════════════════════════════════════════════
-    # Remplacer _execute_timeline (burst : début + fin seulement)
-    # ═══════════════════════════════════════════════════════════════
 
     def _execute_timeline(self) -> None:
         n_events = len(self.timeline)
@@ -1119,11 +1233,16 @@ class ConnectElec(BaseTask):
                 self.EyeTracker.send_message("END_EXP")
                 self.EyeTracker.close_and_transfer_data(self.data_dir)
 
+            # ── SORTIE 1 : CSV complet (tous les événements bruts) ───
             saved_path = self.save_data(
                 data_list=self.global_records,
                 filename_suffix=f"_{self.run_type}_run{self.run_number:02d}",
             )
 
+            # ── SORTIE 2 : TSV événements effectifs (BIDS-like) ─────
+            self._save_bids_events()
+
+            # ── QC optionnel ─────────────────────────────────────────
             if saved_path and os.path.exists(saved_path):
                 try:
                     from tasks.qc.qc_connectelec import qc_connectelec
